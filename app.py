@@ -2240,27 +2240,31 @@ def build_assessment_pdf(
     if not assessor_display:
         assessor_display = "____________________________"
 
-    assessor_table = Table(
-        [
-            [Paragraph("<b>ASSESSOR:</b> " + _pdf_safe_text(assessor_display), body_style)],
-            [Paragraph("<b>SIGNATURE:</b> ____________________________", body_style)],
-        ],
-        colWidths=[78 * mm],
-        hAlign="RIGHT",
-        style=TableStyle([
-            ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 2),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 2),
-            ("TOPPADDING", (0, 0), (-1, -1), 1),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-        ]),
-    )
-    story.append(assessor_table)
+    # Assessor and signature are drawn in the lower-right page area instead of
+    # being part of the flowing story. This prevents the signature line from
+    # being pushed onto a second page when the report nearly fills page 1.
 
     def _draw_footer(canvas, document):
         canvas.saveState()
         page_width, _ = A4
+
+        # Assessor block - lower right, above the footer rule.
+        # The assessment report is intentionally designed as a concise one-page
+        # summary, so this keeps the assessor name and signature together.
+        if document.page == 1:
+            canvas.setFillColor(colors.HexColor("#111111"))
+            canvas.setFont("Helvetica-Bold", 8.5)
+            canvas.drawRightString(
+                page_width - 16 * mm,
+                23.0 * mm,
+                "ASSESSOR: " + assessor_display,
+            )
+            canvas.drawRightString(
+                page_width - 16 * mm,
+                17.5 * mm,
+                "SIGNATURE: ____________________________",
+            )
+
         canvas.setStrokeColor(colors.HexColor("#D9D9D9"))
         canvas.setLineWidth(0.4)
         canvas.line(16 * mm, 12 * mm, page_width - 16 * mm, 12 * mm)
