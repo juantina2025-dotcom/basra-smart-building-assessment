@@ -60,7 +60,7 @@ st.set_page_config(
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "models" / "final_random_forest_pipeline.joblib"
+MODEL_PATH = BASE_DIR / "final_random_forest_pipeline.joblib.gz"
 
 
 # ============================================================
