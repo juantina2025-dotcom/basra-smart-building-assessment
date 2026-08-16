@@ -2106,19 +2106,19 @@ def build_assessment_pdf(
         )
     )
 
-    story.append(Paragraph("Assessment Indices", section_style))
+    story.append(Paragraph("Assessment Levels", section_style))
     calculated_fai_value = summary.get("Calculated FAI", summary.get("FAI"))
     predicted_fai_value = summary.get("AI-Predicted FAI", summary.get("Predicted FAI"))
     index_rows = [
-        ["Damage Index (DI)", _pdf_number(summary.get("DI"))],
-        ["Physical Loss Index (PLI)", _pdf_number(summary.get("PLI"))],
-        ["Test Result Index (TRI)", _pdf_number(summary.get("TRI"))],
-        ["Sustainability Index (SI)", _pdf_number(summary.get("SI"))],
+        ["Damage Level (DI)", _pdf_number(summary.get("DI"))],
+        ["Physical Loss Level (PLI)", _pdf_number(summary.get("PLI"))],
+        ["Test Result Level (TRI)", _pdf_number(summary.get("TRI"))],
+        ["Sustainability Level (SI)", _pdf_number(summary.get("SI"))],
         ["Calculated FAI (MCDA)", _pdf_number(calculated_fai_value)],
         ["AI-Predicted FAI (Random Forest)", _pdf_number(predicted_fai_value)],
     ]
     index_table_data = [
-        [Paragraph("<b>Index</b>", body_style), Paragraph("<b>Value</b>", body_style)]
+        [Paragraph("<b>Level</b>", body_style), Paragraph("<b>Value</b>", body_style)]
     ] + [
         [Paragraph(_pdf_safe_text(label), body_style), Paragraph(_pdf_safe_text(value), body_style)]
         for label, value in index_rows
