@@ -155,7 +155,7 @@ st.markdown(
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "final_random_forest_pipeline.joblib"
+MODEL_PATH = BASE_DIR / "final_random_forest_pipeline.joblib.gz"
 
 
 # ============================================================
@@ -1190,8 +1190,8 @@ def _extract_di_from_excel(excel_file, info):
         if ((damages["Damage_Extent_%"] < 0) | (damages["Damage_Extent_%"] > 100)).any():
             raise ValueError("DI Damage_Extent_% must be within 0–100.")
 
-        if ((damages["Severity_Factor"] < 0) | (damages["Severity_Factor"] > 1)).any():
-            raise ValueError("DI Severity_Factor must be within 0–1.")
+        if not damages["Severity_Factor"].isin([0.25, 0.50, 0.75, 0.90, 1.00]).all():
+            raise ValueError("DI Severity_Factor must be one of 0.25, 0.50, 0.75, 0.90, 1.00.")
 
         damages["Damage_Contribution"] = (
             damages["Damage_Extent_%"]
@@ -1304,8 +1304,8 @@ def _extract_pli_from_excel(excel_file, info):
         if ((losses["Damage_Extent_%"] < 0) | (losses["Damage_Extent_%"] > 100)).any():
             raise ValueError("PLI Damage_Extent_% must be within 0–100.")
 
-        if ((losses["Severity_Factor"] < 0) | (losses["Severity_Factor"] > 1)).any():
-            raise ValueError("PLI Severity_Factor must be within 0–1.")
+        if not losses["Severity_Factor"].isin([0.25, 0.50, 0.75, 0.90, 1.00]).all():
+            raise ValueError("PLI Severity_Factor must be one of 0.25, 0.50, 0.75, 0.90, 1.00.")
 
         losses["Total_Quantity_Recomputed"] = losses["Element_ID"].map(quantity_map).astype(float)
         losses["Physical_Loss_Quantity_Recomputed"] = (
@@ -3267,22 +3267,6 @@ elif selected_mode == "Calculate Assessment Indices":
             )
 
 
-        with ahp_col2:
-
-            st.metric(
-                "AHP Consistency Ratio (CR)",
-                f"{selected_ahp['CR']:.4f}",
-            )
-
-
-        with ahp_col3:
-
-            st.metric(
-                "Total AHP Category Weight",
-                f"{sum(category_weights.values()):.6f}",
-            )
-
-
         if selected_ahp["CR"] <= 0.10:
 
             st.caption(
@@ -3878,19 +3862,9 @@ elif selected_mode == "Calculate Assessment Indices":
 
             with damage_col2:
 
-                entered_severity_factor = st.number_input(
-
+                entered_severity_factor = st.selectbox(
                     "Severity Factor",
-
-                    min_value=0.0,
-
-                    max_value=1.0,
-
-                    value=0.0,
-
-                    step=0.05,
-
-                    format="%.2f",
+                    options=[0.25, 0.50, 0.75, 0.90, 1.00],
 
                     key=(
                         f"damage_severity_input_"
@@ -5074,20 +5048,6 @@ elif selected_mode == "Calculate Assessment Indices":
                 selected_pli_ahp["label"],
             )
 
-        with ahp_col2:
-
-            st.metric(
-                "AHP Consistency Ratio (CR)",
-                f"{selected_pli_ahp['CR']:.4f}",
-            )
-
-        with ahp_col3:
-
-            st.metric(
-                "Total AHP Category Weight",
-                f"{sum(pli_category_weights.values()):.6f}",
-            )
-
         if selected_pli_ahp["CR"] <= 0.10:
 
             st.caption(
@@ -5654,18 +5614,9 @@ elif selected_mode == "Calculate Assessment Indices":
             with damage_input_col2:
 
                 entered_pli_severity = (
-                    st.number_input(
+                    st.selectbox(
                         "Severity Factor",
-
-                        min_value=0.0,
-
-                        max_value=1.0,
-
-                        value=0.0,
-
-                        step=0.05,
-
-                        format="%.2f",
+                        options=[0.25, 0.50, 0.75, 0.90, 1.00],
 
                         key=(
                             f"pli_severity_"
@@ -6334,9 +6285,10 @@ elif selected_mode == "Calculate Assessment Indices":
                 )
 
                 for column_name in [
-                    "Applied_Element_Weight",
+                    "Category_AHP_Weight",
                     "Physical_Loss_Quantity",
                     "Element_PLI",
+                    "Category_PLR",
                     "Weighted_PLI",
                 ]:
 
@@ -6611,12 +6563,6 @@ elif selected_mode == "Calculate Assessment Indices":
             st.metric(
                 "Structural System",
                 selected_tri_ahp["label"],
-            )
-
-        with tri_ahp_col2:
-            st.metric(
-                "AHP Consistency Ratio (CR)",
-                f"{selected_tri_ahp['CR']:.4f}",
             )
 
         with tri_ahp_col3:
@@ -8329,43 +8275,6 @@ elif selected_mode == "Calculate Assessment Indices":
                     use_container_width=True,
                     hide_index=True,
                 )
-
-                # Technical details remain available for audit but are
-                # hidden from the main interface.
-                with st.expander(
-                    "View technical calculation details",
-                    expanded=False,
-                ):
-                    technical_display = si_results[
-                        [
-                            "Criterion_Code",
-                            "Dimension",
-                            "Global_Weight",
-                            "Renormalized_Weight",
-                            "SI_Contribution",
-                        ]
-                    ].copy()
-
-                    for column_name in [
-                        "Global_Weight",
-                        "Renormalized_Weight",
-                        "SI_Contribution",
-                    ]:
-                        technical_display[column_name] = pd.to_numeric(
-                            technical_display[column_name],
-                            errors="coerce",
-                        ).round(6)
-
-                    st.dataframe(
-                        technical_display,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                    st.caption(
-                        f"Applicable weight sum before renormalization: "
-                        f"{applicable_weight_sum:.4f}"
-                    )
 
                 # ============================================
                 # STORE SI RESULT
