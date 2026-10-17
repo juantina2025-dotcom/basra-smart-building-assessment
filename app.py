@@ -1,4 +1,3 @@
-# ============================================================
 # SMART ASSESSMENT MODEL FOR EXISTING BUILDINGS
 # IN URBAN AREAS OF BASRA GOVERNORATE
 # UNIVERSITY OF BASRA - COLLEGE OF ENGINEERING
@@ -54,13 +53,109 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+st.markdown(
+    """
+    <style>
+        :root {
+            --basra-petrol: #0F4C5C;
+            --basra-turquoise: #2A9D8F;
+            --basra-sand: #E9C46A;
+            --basra-ivory: #F8F5EE;
+            --basra-charcoal: #263238;
+        }
+
+        .stApp {
+            background: linear-gradient(180deg, #F8F5EE 0%, #FFFFFF 52%, #F1F8F6 100%);
+            color: var(--basra-charcoal);
+        }
+
+        h1, h2, h3 {
+            color: var(--basra-petrol);
+        }
+
+        a {
+            color: #0F766E;
+        }
+
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #0F4C5C 0%, #123F49 100%);
+            border-right: 4px solid var(--basra-sand);
+        }
+
+        [data-testid="stSidebar"] * {
+            color: var(--basra-ivory);
+        }
+
+        [data-testid="stSidebar"] hr {
+            border-color: rgba(233, 196, 106, 0.42);
+        }
+
+        [data-testid="stSidebar"] [role="radiogroup"] label {
+            border-radius: 9px;
+            padding: 5px 8px;
+            transition: background-color 0.18s ease;
+        }
+
+        [data-testid="stSidebar"] [role="radiogroup"] label:hover {
+            background: rgba(42, 157, 143, 0.32);
+        }
+
+        .stButton > button,
+        [data-testid="stDownloadButton"] > button {
+            border: 1px solid var(--basra-turquoise);
+            border-radius: 10px;
+            color: var(--basra-petrol);
+            background: #FFFFFF;
+            transition: all 0.18s ease;
+        }
+
+        .stButton > button:hover,
+        [data-testid="stDownloadButton"] > button:hover {
+            border-color: var(--basra-sand);
+            color: #FFFFFF;
+            background: var(--basra-petrol);
+            box-shadow: 0 5px 14px rgba(15, 76, 92, 0.18);
+        }
+
+        .stButton > button[kind="primary"] {
+            border-color: var(--basra-turquoise);
+            color: #FFFFFF;
+            background: var(--basra-turquoise);
+            font-weight: 800;
+        }
+
+        [data-testid="stMetric"] {
+            padding: 14px;
+            border: 1px solid #BFD8D3;
+            border-top: 4px solid var(--basra-turquoise);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.94);
+            box-shadow: 0 4px 12px rgba(15, 76, 92, 0.08);
+        }
+
+        [data-testid="stFileUploader"],
+        div[data-testid="stForm"] {
+            border-color: #BFD8D3;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.82);
+        }
+
+        button[data-baseweb="tab"][aria-selected="true"] {
+            color: var(--basra-petrol);
+            border-bottom-color: var(--basra-sand);
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ============================================================
 # PROJECT PATHS
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "final_random_forest_pipeline.joblib.gz"
+MODEL_PATH = BASE_DIR / "final_random_forest_pipeline.joblib"
 
 
 # ============================================================
@@ -1130,6 +1225,26 @@ def _extract_di_from_excel(excel_file, info):
     return di_value, system, elements, damages
 
 
+
+def _category_based_pli(elements, quantity_col, loss_col):
+    """Physical loss index: quantity-weighted within each category, AHP-weighted across categories."""
+    data = elements.copy()
+    data[loss_col] = data[[loss_col, quantity_col]].min(axis=1).clip(lower=0.0)
+    data["Element_PLI"] = 100.0 * data[loss_col] / data[quantity_col]
+    data["Category_Total_Quantity"] = data.groupby("Element_Type")[quantity_col].transform("sum")
+    data["Category_Total_Loss"] = data.groupby("Element_Type")[loss_col].transform("sum")
+    data["Category_PLR"] = 100.0 * data["Category_Total_Loss"] / data["Category_Total_Quantity"]
+    # Weighted_PLI is an element's additive contribution to the numerator,
+    # NOT its former element-AHP-weighted loss percentage.
+    data["Weighted_PLI"] = (100.0 * data["Category_AHP_Weight"]
+                            * data[loss_col] / data["Category_Total_Quantity"])
+    categories = data.drop_duplicates("Element_Type")
+    total_weight = float(categories["Category_AHP_Weight"].sum())
+    if total_weight <= 0:
+        raise ValueError("Sum of present category AHP weights must be positive")
+    result = float((categories["Category_AHP_Weight"] * categories["Category_PLR"]).sum() / total_weight)
+    return result, data, total_weight
+
 def _extract_pli_from_excel(excel_file, info):
     system = _normalize_structural_system(info.get("Structural_System"))
     elements = _prepare_element_inventory(
@@ -1208,29 +1323,9 @@ def _extract_pli_from_excel(excel_file, info):
         element_loss_map = {}
 
     elements["Total_Physical_Loss"] = elements["Element_ID"].map(element_loss_map).fillna(0.0)
-    elements["Element_PLI"] = (
-        elements["Total_Physical_Loss"]
-        / elements["Total_Quantity"]
-        * 100.0
+    pli_value, elements, _ = _category_based_pli(
+        elements, "Total_Quantity", "Total_Physical_Loss"
     )
-
-    over_limit = elements[elements["Element_PLI"] > 100.0 + 1e-9]
-    if len(over_limit) > 0:
-        raise ValueError(
-            "Element_PLI exceeds 100 for: "
-            + ", ".join(over_limit["Element_ID"].tolist())
-            + ". Review overlapping or duplicated physical-loss records."
-        )
-
-    denominator = float(elements["Applied_Element_Weight"].sum())
-    if denominator <= 0:
-        raise ValueError("The applied PLI element-weight sum is zero.")
-
-    elements["Weighted_PLI"] = (
-        elements["Applied_Element_Weight"]
-        * elements["Element_PLI"]
-    )
-    pli_value = float(elements["Weighted_PLI"].sum() / denominator)
 
     return pli_value, system, elements, losses
 
@@ -1815,7 +1910,7 @@ def load_uploaded_result_into_session(result):
             "SI": round(float(result["SI"]), 2),
             "Calculated FAI": round(float(result["FAI"]), 2),
             "AI-Predicted FAI": "Not Available",
-            "Final Assessment Building Index": round(float(result["FAI"]), 2),
+            "Calculated FAI (MCDA)": round(float(result["FAI"]), 2),
             "Building Condition": result["FAI_Condition_Class"],
             "FAI Scenario": result["FAI_Scenario"],
             "Critical Failure Index": critical_flag,
@@ -1925,21 +2020,17 @@ def _optional_fai_value(value):
 
 def calculate_final_assessment_building_index(calculated_fai, ai_predicted_fai):
     """
-    Final reporting fusion rule requested for the application:
-    - if both FAI estimates are available, use their arithmetic mean;
-    - if only one is available, use that available estimate;
-    - if neither is available, return None.
-    Both estimates are already expressed on the same 0-100 scale.
+    Backward-compatible reporting helper.
+    The MCDA-calculated FAI remains the assessment reference and is never
+    averaged with the AI prediction. The AI value is reported separately.
     """
     calculated = _optional_fai_value(calculated_fai)
     predicted = _optional_fai_value(ai_predicted_fai)
 
-    if calculated is not None and predicted is not None:
-        return (calculated + predicted) / 2.0, "Mean of Calculated FAI and AI-Predicted FAI"
     if calculated is not None:
-        return calculated, "Calculated FAI only - AI prediction not available"
+        return calculated, "Calculated FAI (MCDA); AI prediction reported separately"
     if predicted is not None:
-        return predicted, "AI-Predicted FAI only - calculated FAI not available"
+        return predicted, "AI-Predicted FAI only; calculated FAI not available"
     return None, "Not Available"
 
 
@@ -1984,7 +2075,7 @@ def build_assessment_pdf(
         fontSize=15,
         leading=18,
         alignment=TA_CENTER,
-        textColor=colors.HexColor("#163A5F"),
+        textColor=colors.HexColor("#0F4C5C"),
         spaceAfter=5,
     )
     subtitle_style = ParagraphStyle(
@@ -1994,7 +2085,7 @@ def build_assessment_pdf(
         fontSize=9,
         leading=12,
         alignment=TA_CENTER,
-        textColor=colors.HexColor("#2F75B5"),
+        textColor=colors.HexColor("#2A9D8F"),
         spaceAfter=2,
     )
     section_style = ParagraphStyle(
@@ -2003,7 +2094,7 @@ def build_assessment_pdf(
         fontName="Helvetica-Bold",
         fontSize=11,
         leading=14,
-        textColor=colors.HexColor("#163A5F"),
+        textColor=colors.HexColor("#0F4C5C"),
         spaceBefore=7,
         spaceAfter=5,
     )
@@ -2047,7 +2138,7 @@ def build_assessment_pdf(
     story.append(Paragraph("IN URBAN AREAS OF BASRA GOVERNORATE", subtitle_style))
     story.append(Paragraph("BUILDING ASSESSMENT SUMMARY REPORT", subtitle_style))
     story.append(Spacer(1, 3 * mm))
-    story.append(HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#A6A6A6")))
+    story.append(HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#91B9B0")))
     story.append(Spacer(1, 3 * mm))
 
     report_date = datetime.now().strftime("%d %B %Y")
@@ -2059,8 +2150,8 @@ def build_assessment_pdf(
             ],
             colWidths=[44 * mm, 132 * mm],
             style=TableStyle([
-                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EAF0F6")),
-                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#A6A6A6")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E8F3F0")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
                 ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
@@ -2092,10 +2183,10 @@ def build_assessment_pdf(
             colWidths=[52 * mm, 124 * mm],
             repeatRows=1,
             style=TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2F75B5")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F4C5C")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#F2F2F2")),
-                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#A6A6A6")),
+                ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#F8F5EE")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
                 ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
@@ -2129,10 +2220,10 @@ def build_assessment_pdf(
             colWidths=[116 * mm, 60 * mm],
             repeatRows=1,
             style=TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2F75B5")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F4C5C")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("ALIGN", (1, 1), (1, -1), "CENTER"),
-                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#A6A6A6")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
                 ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
@@ -2143,13 +2234,16 @@ def build_assessment_pdf(
         )
     )
 
-    final_building_index, final_index_basis = calculate_final_assessment_building_index(
-        calculated_fai_value,
-        predicted_fai_value,
+    calculated_fai_numeric = _optional_fai_value(calculated_fai_value)
+    predicted_fai_numeric = _optional_fai_value(predicted_fai_value)
+    calculated_condition = (
+        get_fai_class(calculated_fai_numeric)
+        if calculated_fai_numeric is not None
+        else "Not Available"
     )
-    building_condition = (
-        get_fai_class(final_building_index)
-        if final_building_index is not None
+    predicted_condition = (
+        get_fai_class(predicted_fai_numeric)
+        if predicted_fai_numeric is not None
         else "Not Available"
     )
     critical_failure_index = summary.get(
@@ -2159,11 +2253,8 @@ def build_assessment_pdf(
 
     story.append(Paragraph("Final Assessment", section_style))
     final_rows = [
-        [
-            "FINAL ASSESSMENT BUILDING INDEX =",
-            _pdf_number(final_building_index),
-        ],
-        ["BUILDING CONDITION", building_condition],
+        ["CALCULATED FAI CONDITION", calculated_condition],
+        ["AI-PREDICTED FAI CONDITION", predicted_condition],
         ["CRITICAL FAILURE INDEX", critical_failure_index],
         ["SAFETY OVERRIDE STATUS", summary.get("Safety Override Status")],
         ["FINAL DECISION", summary.get("Final Decision")],
@@ -2187,10 +2278,10 @@ def build_assessment_pdf(
         final_table_data,
         colWidths=[88 * mm, 88 * mm],
         style=TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#163A5F")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F4C5C")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#EAF0F6")),
-            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#A6A6A6")),
+            ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#E8F3F0")),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#91B9B0")),
             ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("ALIGN", (1, 0), (1, -1), "CENTER"),
@@ -2204,11 +2295,8 @@ def build_assessment_pdf(
     story.append(Spacer(1, 2 * mm))
     story.append(
         Paragraph(
-            "<b>Final index rule:</b> "
-            + _pdf_safe_text(final_index_basis)
-            + ". When both FAI estimates are available, the final building index is "
-              "their arithmetic mean on the common 0-100 scale; otherwise, the single "
-              "available FAI estimate is used.",
+            "<b>Reporting rule:</b> The MCDA-calculated FAI and the AI-predicted FAI "
+            "are reported independently. No arithmetic mean or fused FAI is calculated.",
             center_small_style,
         )
     )
@@ -2293,6 +2381,8 @@ def _assessment_pdf_filename(summary_df):
 SESSION_DEFAULTS = {
 
     "entered_app": False,
+
+    "application_menu": "Home",
 
     "latest_assessment_summary": None,
 
@@ -2385,9 +2475,16 @@ if not st.session_state.entered_app:
 
             .welcome-box {
                 text-align: center;
-                padding-top: 18px;
-                padding-bottom: 24px;
+                max-width: 1050px;
+                margin: 0 auto;
+                padding: 16px 36px 24px 36px;
                 font-family: Arial, Helvetica, sans-serif;
+                background: linear-gradient(145deg, rgba(255,255,255,0.97), rgba(248,245,238,0.97));
+                border: 1px solid #BFD8D3;
+                border-top: 7px solid #0F4C5C;
+                border-bottom: 5px solid #E9C46A;
+                border-radius: 22px;
+                box-shadow: 0 12px 30px rgba(15,76,92,0.12);
             }
 
             .college-logo {
@@ -2399,56 +2496,57 @@ if not st.session_state.entered_app:
             }
 
             .university {
-                font-size: 44px;
+                font-size: 25px;
                 font-weight: 900;
-                color: #0B1F33;
-                margin-bottom: 10px;
+                color: #0F4C5C;
+                margin-bottom: 5px;
             }
 
             .college {
-                font-size: 34px;
+                font-size: 22px;
                 font-weight: 900;
-                color: #0B1F33;
-                margin-bottom: 8px;
+                color: #0F4C5C;
+                margin-bottom: 4px;
             }
 
             .department {
-                font-size: 30px;
+                font-size: 19px;
                 font-weight: 900;
-                color: #0B1F33;
-                margin-bottom: 22px;
+                color: #0F4C5C;
+                margin-bottom: 16px;
             }
 
             .divider-line {
                 width: 62%;
                 height: 4px;
-                background: #0B1F33;
+                background: linear-gradient(90deg, #2A9D8F, #E9C46A);
                 margin: 18px auto 28px auto;
                 border-radius: 4px;
             }
 
             .model-name {
-                font-size: 43px;
+                font-size: 27px;
                 font-weight: 900;
-                color: #07192B;
-                line-height: 1.22;
-                margin-bottom: 12px;
+                color: #0F4C5C;
+                line-height: 1.34;
+                margin: 0 auto 18px auto;
+                max-width: 980px;
             }
 
-            .study-area {
-                font-size: 31px;
-                font-weight: 900;
-                color: #07192B;
-                line-height: 1.25;
-            }
-
-            .developer-name {
-                margin-top: 24px;
-                font-size: 15px;
+            .thesis-line {
+                font-size: 16px;
                 font-weight: 700;
-                letter-spacing: 0.45px;
-                color: #486581;
-                text-align: center;
+                color: #263238;
+                line-height: 1.45;
+                margin: 5px auto;
+            }
+
+            .author-block {
+                margin-top: 17px;
+                font-size: 17px;
+                font-weight: 800;
+                line-height: 1.65;
+                color: #0F4C5C;
             }
 
         </style>
@@ -2478,15 +2576,25 @@ if not st.session_state.entered_app:
             <div class="divider-line"></div>
 
             <div class="model-name">
-                SMART ASSESSMENT MODEL FOR EXISTING BUILDINGS
+                A SMART ASSESSMENT MODEL FOR THE SUSTAINABILITY OF EXISTING BUILDINGS
+                IN URBAN AREAS IN BASRA GOVERNORATE USING ARTIFICIAL INTELLIGENCE
+                TECHNIQUES AND A MULTI-CRITERIA SCORING SYSTEM
             </div>
 
-            <div class="study-area">
-                IN URBAN AREAS OF BASRA GOVERNORATE
+            <div class="thesis-line">
+                A THESIS SUBMITTED TO THE COLLEGE OF ENGINEERING, UNIVERSITY OF BASRA
             </div>
 
-            <div class="developer-name">
-                DEVELOPED BY ENG. JWAN FALIH DUBOONI 2026
+            <div class="thesis-line">
+                IN PARTIAL FULFILMENT OF THE REQUIREMENTS FOR THE DEGREE OF
+                MASTER OF SCIENCE IN CIVIL ENGINEERING (STRUCTURES)
+            </div>
+
+            <div class="author-block">
+                BY<br>
+                JWAN FALEH HASSAN<br>
+                <span style="font-size:15px;font-weight:700;">(B.SC. CIVIL ENGINEERING)</span><br>
+                2026
             </div>
 
         </div>
@@ -2518,6 +2626,11 @@ if not st.session_state.entered_app:
 # SIDEBAR
 # ============================================================
 
+def navigate_to(page_name):
+    """Navigate to a main application module from a Home-screen button."""
+    st.session_state.application_menu = page_name
+
+
 with st.sidebar:
 
     st.html(
@@ -2530,7 +2643,7 @@ with st.sidebar:
             <div style="
                 font-size:23px;
                 font-weight:900;
-                color:#0B1F33;
+                color:#F8F5EE;
                 line-height:1.25;
             ">
 
@@ -2542,7 +2655,7 @@ with st.sidebar:
             <div style="
                 font-size:14px;
                 font-weight:700;
-                color:#486581;
+                color:#DDEFEA;
                 margin-top:12px;
                 line-height:1.5;
             ">
@@ -2575,6 +2688,8 @@ with st.sidebar:
 
             "Home",
 
+            "Instructions",
+
             "New Building Assessment",
 
             "Calculate Assessment Indices",
@@ -2587,6 +2702,8 @@ with st.sidebar:
 
             "Results & Reports",
         ],
+
+        key="application_menu",
     )
 
 
@@ -2599,6 +2716,8 @@ with st.sidebar:
     ):
 
         st.session_state.entered_app = False
+
+        st.session_state.application_menu = "Home"
 
         st.rerun()
 
@@ -2621,7 +2740,7 @@ if selected_mode == "Home":
 
                 font-weight:900;
 
-                color:#0B1F33;
+                color:#0F4C5C;
 
                 margin-top:15px;
 
@@ -2637,7 +2756,7 @@ if selected_mode == "Home":
 
                 font-weight:800;
 
-                color:#34495E;
+                color:#2A9D8F;
 
                 margin-bottom:35px;
             }
@@ -2645,9 +2764,11 @@ if selected_mode == "Home":
 
             .intro-box {
 
-                background-color:#F5F7FA;
+                background-color:#FFFDF7;
 
-                border:1px solid #D9E2EC;
+                border:1px solid #BFD8D3;
+
+                border-left:6px solid #E9C46A;
 
                 border-radius:12px;
 
@@ -2657,49 +2778,35 @@ if selected_mode == "Home":
 
                 line-height:1.7;
 
-                color:#243B53;
+                color:#263238;
 
                 margin-bottom:30px;
             }
 
 
-            .module-card {
-
+            section.main div[data-testid="stButton"] > button {
+                min-height:58px;
+                border:1px solid #BFD8D3;
+                border-radius:12px;
+                color:#0F4C5C;
                 background:#FFFFFF;
-
-                border:1px solid #D9E2EC;
-
-                border-radius:14px;
-
-                padding:22px;
-
-                min-height:180px;
-
-                margin-bottom:20px;
-
-                box-shadow:0 2px 7px rgba(0,0,0,.06);
+                font-size:18px;
+                font-weight:800;
+                white-space:normal;
+                box-shadow:0 5px 14px rgba(15,76,92,0.08);
             }
 
-
-            .module-title {
-
-                font-size:23px;
-
-                font-weight:900;
-
-                color:#102A43;
-
-                margin-bottom:12px;
+            section.main div[data-testid="stButton"] > button:hover {
+                color:#FFFFFF;
+                background:#2A9D8F;
+                border-color:#E9C46A;
             }
 
-
-            .module-text {
-
-                font-size:16px;
-
-                line-height:1.55;
-
-                color:#486581;
+            section.main div[data-testid="stVerticalBlockBorderWrapper"] {
+                border-color:#BFD8D3;
+                border-radius:16px;
+                background:rgba(255,255,255,0.92);
+                box-shadow:0 6px 18px rgba(15,76,92,0.08);
             }
 
         </style>
@@ -2730,6 +2837,16 @@ if selected_mode == "Home":
         """
     )
 
+    st.button(
+        "📘 Instructions — How to Use the Application",
+        key="home_instructions_button",
+        use_container_width=True,
+        on_click=navigate_to,
+        args=("Instructions",),
+    )
+
+    st.write("")
+
 
     home_cards = [
 
@@ -2737,6 +2854,8 @@ if selected_mode == "Home":
             "🏢 New Building Assessment",
 
             "Perform a complete building assessment workflow.",
+
+            "New Building Assessment",
         ),
 
 
@@ -2744,6 +2863,8 @@ if selected_mode == "Home":
             "🧮 Calculate Assessment Indices",
 
             "Calculate DI, PLI, TRI, and SI.",
+
+            "Calculate Assessment Indices",
         ),
 
 
@@ -2751,6 +2872,8 @@ if selected_mode == "Home":
             "🤖 AI Assessment from Existing Indices",
 
             "Predict FAI from existing assessment indices.",
+
+            "AI Assessment from Existing Indices",
         ),
 
 
@@ -2758,6 +2881,8 @@ if selected_mode == "Home":
             "📥 Download Assessment Templates",
 
             "Download standardized Excel assessment templates.",
+
+            "Download Assessment Templates",
         ),
 
 
@@ -2765,6 +2890,8 @@ if selected_mode == "Home":
             "📤 Upload Completed Assessment Files",
 
             "Upload completed assessment workbooks.",
+
+            "Upload Completed Assessment Files",
         ),
 
 
@@ -2772,6 +2899,8 @@ if selected_mode == "Home":
             "📄 Results & Reports",
 
             "Review stored outputs and generate reports.",
+
+            "Results & Reports",
         ),
     ]
 
@@ -2790,32 +2919,148 @@ if selected_mode == "Home":
             home_cards[start:start + 2],
         ):
 
-            title, text = card
+            title, text, target_page = card
 
 
             with col:
 
-                st.html(
-                    f"""
-                    <div class="module-card">
+                with st.container(border=True):
 
-                        <div class="module-title">
+                    st.button(
+                        title,
+                        key="home_" + target_page.lower().replace(" ", "_"),
+                        use_container_width=True,
+                        on_click=navigate_to,
+                        args=(target_page,),
+                    )
 
-                            {title}
+                    st.caption(text)
 
-                        </div>
+                    st.write("")
 
 
-                        <div class="module-text">
+    st.stop()
 
-                            {text}
 
-                        </div>
+# ============================================================
+# INSTRUCTIONS
+# ============================================================
 
-                    </div>
-                    """
-                )
+elif selected_mode == "Instructions":
 
+    st.title("Instructions — How to Use the Application")
+
+    st.info(
+        "This application evaluates one building per assessment operation. "
+        "Use the Home-screen buttons or the sidebar menu to open any module directly."
+    )
+
+    st.subheader("Available Assessment Paths")
+
+    st.markdown(
+        """
+        **Path 1 — Enter previously calculated indices**  
+        Open **AI Assessment from Existing Indices**, enter the building information and
+        the available DI, PLI, TRI, and SI values, then run the assessment.
+
+        **Path 2 — Calculate indices inside the application**  
+        Open **Calculate Assessment Indices** and calculate DI, PLI, TRI, and SI from
+        the detailed engineering assessment records.
+
+        **Path 3 — Use the standardized Excel templates**  
+        Download a template, complete it for one building, and upload it through
+        **Upload Completed Assessment Files**.
+        """
+    )
+
+    st.subheader("Recommended Workflow")
+
+    st.markdown(
+        """
+        1. Record the building name, function, structural system, age, and number of floors.
+        2. Enter or calculate the Damage Index (DI) and Physical Loss Index (PLI).
+        3. Enter the Test Result Index (TRI) only when documented test results are available.
+        4. When tests are unavailable, select **TRI Not Available**; do not enter zero as a substitute.
+        5. Enter or calculate the Sustainability Index (SI).
+        6. Complete the Critical Failure Assessment in every assessment path.
+        7. Review the calculated FAI and, when the AI module is used, the AI-predicted FAI.
+        8. Open **Results & Reports** to review the output and download the PDF report.
+        """
+    )
+
+    st.subheader("Important Interpretation Rules")
+
+    interpretation_col1, interpretation_col2 = st.columns(2)
+
+    with interpretation_col1:
+        st.warning(
+            "Calculated FAI and AI-Predicted FAI are displayed independently. "
+            "The application does not average or merge them."
+        )
+
+    with interpretation_col2:
+        st.error(
+            "The Critical Failure Safety Veto is independent of the numerical FAI. "
+            "When activated, it requires immediate safety action."
+        )
+
+    st.subheader("FAI Condition Classes")
+
+    st.table(
+        pd.DataFrame(
+            {
+                "FAI Range": ["70–100", "55–69.99", "40–54.99", "0–39.99"],
+                "Condition Class": ["Good", "Moderate", "Poor", "Critical"],
+            }
+        )
+    )
+
+    st.subheader("Excel Template Rules")
+
+    st.markdown(
+        """
+        - Use one workbook for one building.
+        - Do not rename worksheets or column headings.
+        - Complete all required building-information fields.
+        - Keep TRI as **Not Available** when no documented test results exist.
+        - Complete the Safety Override sheet even when no critical failure is present.
+        - Review entered values before uploading the workbook.
+        """
+    )
+
+    st.caption(
+        "The application is a decision-support tool and does not replace detailed "
+        "structural investigation or professional engineering judgement."
+    )
+
+    instruction_col1, instruction_col2, instruction_col3 = st.columns(3)
+
+    with instruction_col1:
+        st.button(
+            "Start New Assessment",
+            key="instructions_new_assessment",
+            use_container_width=True,
+            on_click=navigate_to,
+            args=("New Building Assessment",),
+        )
+
+    with instruction_col2:
+        st.button(
+            "Calculate Indices",
+            key="instructions_calculate_indices",
+            use_container_width=True,
+            on_click=navigate_to,
+            args=("Calculate Assessment Indices",),
+        )
+
+    with instruction_col3:
+        st.button(
+            "Download Templates",
+            key="instructions_download_templates",
+            use_container_width=True,
+            on_click=navigate_to,
+            args=("Download Assessment Templates",),
+        )
 
     st.stop()
 
@@ -3289,7 +3534,7 @@ elif selected_mode == "Calculate Assessment Indices":
         # ====================================================
 
         st.markdown(
-            "#### Automatic AHP Weight Distribution"
+            "#### Category AHP Weights (applied once per category)"
         )
 
 
@@ -3344,9 +3589,8 @@ elif selected_mode == "Calculate Assessment Indices":
 
         st.caption(
             """
-            Applied Element Weight =
-            AHP Category Weight ÷
-            Number of physical elements in that category.
+            PLI uses Category_AHP_Weight once per category. Applied_Element_Weight
+            is a legacy DI allocation field and is NOT used to calculate PLI.
             """
         )
 
@@ -4627,7 +4871,7 @@ elif selected_mode == "Calculate Assessment Indices":
                 with summary_col1:
 
                     st.metric(
-                        "Sum of Applied Weights",
+                        "Sum of Present Category Weights",
                         f"{total_applied_weight:.6f}",
                     )
 
@@ -4773,48 +5017,10 @@ elif selected_mode == "Calculate Assessment Indices":
         # PLI EQUATIONS
         # ====================================================
 
-        st.latex(
-            r"L_{ir}"
-            r"="
-            r"Q_i"
-            r"\times"
-            r"\frac{E_{ir}}{100}"
-            r"\times"
-            r"S_{ir}"
-        )
-
-        st.latex(
-            r"PLI_i"
-            r"="
-            r"\frac{\sum_r L_{ir}}{Q_i}"
-            r"\times100"
-        )
-
-        st.latex(
-            r"PLI"
-            r"="
-            r"\frac{\sum_i W_iPLI_i}"
-            r"{\sum_iW_i}"
-        )
-
-        st.caption(
-            "Q = Total Element Quantity | "
-            "E = Damage Extent (%) | "
-            "S = Severity Factor | "
-            "W = Applied AHP Element Weight"
-        )
-
-        st.info(
-            """
-            Important:
-            PLI does not automatically reuse DI damage records.
-
-            Damage Type, Damage Extent, and Severity Factor
-            are entered independently in this module.
-            """
-        )
-
-        st.divider()
+        st.latex(r"L_i=\min\left(Q_i,\sum_r Q_i\frac{E_{ir}}{100}S_{ir}\right)")
+        st.latex(r"PLR_c=\frac{\sum_{i\in c}L_i}{\sum_{i\in c}Q_i}\times100")
+        st.latex(r"PLI=\frac{\sum_c W_c PLR_c}{\sum_c W_c}")
+        st.caption("Category AHP weights are applied once per category; quantities within a category use the same measurement unit.")
 
         # ====================================================
         # 1. STRUCTURAL SYSTEM
@@ -6048,107 +6254,10 @@ elif selected_mode == "Calculate Assessment Indices":
                     .fillna(0.0)
                 )
 
-                pli_element_results[
-                    "Element_PLI"
-                ] = (
-                    pli_element_results[
-                        "Physical_Loss_Quantity"
-                    ]
-                    /
-                    pli_element_results[
-                        "Quantity"
-                    ]
-                    *
-                    100.0
-                )
-
-                # ============================================
-                # PLI > 100 QA
-                # ============================================
-
-                if (
-                    pli_element_results[
-                        "Element_PLI"
-                    ] > 100.000001
-                ).any():
-
-                    problem_pli_elements = (
-                        pli_element_results.loc[
-                            pli_element_results[
-                                "Element_PLI"
-                            ] > 100.000001,
-
-                            "Element_ID",
-                        ]
-                        .tolist()
-                    )
-
-                    st.error(
-                        """
-                        Element PLI exceeded 100 for:
-
-                        """
-                        + ", ".join(
-                            problem_pli_elements
-                        )
-                        +
-                        """
-
-                        Review overlapping or duplicated
-                        Damage Extent records.
-
-                        The application will not
-                        automatically cap the value.
-                        """
-                    )
-
-                    st.stop()
-
-                # ============================================
-                # WEIGHTED PLI
-                # ============================================
-
-                pli_element_results[
-                    "Weighted_PLI"
-                ] = (
-                    pli_element_results[
-                        "Applied_Element_Weight"
-                    ]
-                    *
-                    pli_element_results[
-                        "Element_PLI"
-                    ]
-                )
-
-                total_pli_weight = (
-                    pli_element_results[
-                        "Applied_Element_Weight"
-                    ]
-                    .sum()
-                )
-
-                if total_pli_weight <= 0:
-
-                    st.error(
-                        """
-                        Sum of Applied Element Weights
-                        must be greater than zero.
-                        """
-                    )
-
-                    st.stop()
-
-                # ============================================
-                # FINAL PLI
-                # ============================================
-
-                final_pli = (
-                    pli_element_results[
-                        "Weighted_PLI"
-                    ]
-                    .sum()
-                    /
-                    total_pli_weight
+                # Cap physical loss at the actual quantity for each element,
+                # then aggregate quantity ratios at CATEGORY level.
+                final_pli, pli_element_results, total_pli_weight = _category_based_pli(
+                    pli_element_results, "Quantity", "Physical_Loss_Quantity"
                 )
 
                 # ============================================
@@ -6214,9 +6323,10 @@ elif selected_mode == "Calculate Assessment Indices":
                             "Element_Type",
                             "Quantity",
                             "Measurement_Basis",
-                            "Applied_Element_Weight",
+                            "Category_AHP_Weight",
                             "Physical_Loss_Quantity",
                             "Element_PLI",
+                            "Category_PLR",
                             "Weighted_PLI",
                         ]
                     ]
@@ -9014,13 +9124,14 @@ elif selected_mode == "Results & Reports":
 
         calculated_report_fai = st.session_state.get("latest_calculated_fai")
         ai_report_fai = st.session_state.get("latest_predicted_fai")
-        final_report_index, final_report_basis = calculate_final_assessment_building_index(
-            calculated_report_fai,
-            ai_report_fai,
+        calculated_report_condition = (
+            get_fai_class(float(calculated_report_fai))
+            if calculated_report_fai is not None
+            else "Not Available"
         )
-        final_report_condition = (
-            get_fai_class(final_report_index)
-            if final_report_index is not None
+        ai_report_condition = (
+            get_fai_class(float(ai_report_fai))
+            if ai_report_fai is not None
             else "Not Available"
         )
 
@@ -9044,20 +9155,18 @@ elif selected_mode == "Results & Reports":
 
         with report_col3:
             st.metric(
-                "FINAL ASSESSMENT BUILDING INDEX",
-                f"{float(final_report_index):.2f}"
-                if final_report_index is not None
-                else "Not Available",
+                "Calculated FAI Condition",
+                calculated_report_condition,
             )
 
         with report_col4:
             st.metric(
-                "BUILDING CONDITION",
-                final_report_condition,
+                "AI-Predicted FAI Condition",
+                ai_report_condition,
             )
 
-        st.session_state.latest_final_assessment_building_index = final_report_index
-        st.session_state.latest_building_condition = final_report_condition
+        st.session_state.latest_final_assessment_building_index = calculated_report_fai
+        st.session_state.latest_building_condition = calculated_report_condition
 
         summary_dict_for_report = _assessment_summary_to_dict(
             st.session_state.latest_assessment_summary
@@ -9074,9 +9183,12 @@ elif selected_mode == "Results & Reports":
         st.subheader("Final Assessment")
         final_assessment_display = pd.DataFrame(
             [
-                ["FINAL ASSESSMENT BUILDING INDEX =",
-                 f"{float(final_report_index):.2f}" if final_report_index is not None else "Not Available"],
-                ["BUILDING CONDITION", final_report_condition],
+                ["CALCULATED FAI",
+                 f"{float(calculated_report_fai):.2f}" if calculated_report_fai is not None else "Not Available"],
+                ["CALCULATED FAI CONDITION", calculated_report_condition],
+                ["AI-PREDICTED FAI",
+                 f"{float(ai_report_fai):.2f}" if ai_report_fai is not None else "Not Available"],
+                ["AI-PREDICTED FAI CONDITION", ai_report_condition],
                 ["CRITICAL FAILURE INDEX", critical_failure_index],
                 ["SAFETY OVERRIDE STATUS", safety_status_for_report],
                 ["FINAL DECISION", st.session_state.latest_final_decision],
@@ -9089,9 +9201,8 @@ elif selected_mode == "Results & Reports":
             hide_index=True,
         )
         st.caption(
-            "Final index rule: " + final_report_basis + ". "
-            "If both FAI estimates are available, the final index is their arithmetic mean; "
-            "otherwise, the single available FAI estimate is used."
+            "Calculated FAI and AI-Predicted FAI are reported independently. "
+            "No arithmetic mean or fused FAI is calculated."
         )
 
         _, assessor_col = st.columns([2, 1])
@@ -9112,8 +9223,8 @@ elif selected_mode == "Results & Reports":
         st.subheader("PDF Assessment Report")
         st.caption(
             "Download a dated summary report containing building information, "
-            "Calculated FAI, AI-Predicted FAI, the Final Assessment Building Index, "
-            "Building Condition, Critical Failure Index, Safety Override Status, "
+            "Calculated FAI and its condition, AI-Predicted FAI and its condition, "
+            "Critical Failure Index, Safety Override Status, "
             "Final Decision, assessor name, and signature field."
         )
 
@@ -9738,7 +9849,7 @@ elif selected_mode == "AI Assessment from Existing Indices":
 
                 final_decision = (
                     "Condition-Based Decision - "
-                    + predicted_class
+                    + calculated_fai_class
                 )
 
 
@@ -9754,13 +9865,8 @@ elif selected_mode == "AI Assessment from Existing Indices":
             )
 
 
-            final_assessment_building_index, final_assessment_basis = (
-                calculate_final_assessment_building_index(
-                    calculated_fai,
-                    predicted_fai,
-                )
-            )
-            building_condition = get_fai_class(final_assessment_building_index)
+            calculated_condition = calculated_fai_class
+            ai_predicted_condition = predicted_class
 
             assessment_col1, assessment_col2, assessment_col3, assessment_col4 = (
                 st.columns(4)
@@ -9780,19 +9886,19 @@ elif selected_mode == "AI Assessment from Existing Indices":
 
             with assessment_col3:
                 st.metric(
-                    "FINAL ASSESSMENT BUILDING INDEX",
-                    f"{final_assessment_building_index:.2f}",
+                    "Calculated FAI Condition",
+                    calculated_condition,
                 )
 
             with assessment_col4:
                 st.metric(
-                    "BUILDING CONDITION",
-                    building_condition,
+                    "AI-Predicted FAI Condition",
+                    ai_predicted_condition,
                 )
 
             st.caption(
-                "Final index rule: " + final_assessment_basis
-                + " | FAI Scenario: " + calculated_fai_scenario
+                "Calculated FAI and AI-Predicted FAI are reported independently; "
+                "no arithmetic mean is calculated. FAI Scenario: " + calculated_fai_scenario
             )
 
 
@@ -9912,15 +10018,16 @@ elif selected_mode == "AI Assessment from Existing Indices":
                     ),
 
 
-                "Final Assessment Building Index":
-                    round(
-                        final_assessment_building_index,
-                        2,
-                    ),
+                "Calculated FAI Condition":
+                    calculated_condition,
+
+
+                "AI-Predicted FAI Condition":
+                    ai_predicted_condition,
 
 
                 "Building Condition":
-                    building_condition,
+                    calculated_condition,
 
 
                 "FAI Scenario":
@@ -10005,12 +10112,12 @@ elif selected_mode == "AI Assessment from Existing Indices":
 
 
             st.session_state.latest_final_assessment_building_index = (
-                final_assessment_building_index
+                calculated_fai
             )
 
 
             st.session_state.latest_building_condition = (
-                building_condition
+                calculated_condition
             )
 
 
