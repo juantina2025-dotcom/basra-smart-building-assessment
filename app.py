@@ -1197,7 +1197,7 @@ def _extract_di_from_excel(excel_file, info):
             damages["Damage_Extent_%"]
             * damages["Severity_Factor"]
         )
-        element_di_map = damages.groupby("Element_ID")["Damage_Contribution"].sum().to_dict()
+        element_di_map = damages.groupby("Element_ID")["Damage_Contribution"].max().to_dict()
     else:
         damages["Damage_Contribution"] = pd.Series(dtype=float)
         element_di_map = {}
@@ -4539,7 +4539,7 @@ elif selected_mode == "Calculate Assessment Indices":
                             "Damage_Contribution"
                         ]
 
-                        .sum()
+                        .max()
 
                         .rename(
                             columns={
