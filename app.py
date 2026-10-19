@@ -1262,7 +1262,31 @@ def _extract_pli_from_excel(excel_file, info):
             + ", ".join(missing)
         )
 
-    candidate_mask = losses[required].notna().any(axis=1)
+    # Only assessment records should enter PLI validation. The shared Excel
+    # template may contain audit formulas below the input table (e.g. F59),
+    # which must not be interpreted as incomplete damage records.
+    if "Loss_Record_ID" not in losses.columns:
+        raise ValueError("Physical_Loss is missing required column: Loss_Record_ID.")
+
+    record_id = losses["Loss_Record_ID"].apply(_excel_text)
+    element_id = losses["Element_ID"].apply(_excel_text)
+    severity = losses["Severity_Factor"].apply(_excel_text)
+    identified = record_id.ne("")
+    last_record_index = losses.index[identified].max() if identified.any() else None
+
+    # Include incomplete rows between recorded damage entries, even when their
+    # ID is missing; also catch entries with an Element_ID or severity beyond
+    # the identified range. A lone extent value outside the input area is an
+    # audit-cell candidate, not by itself a damage record.
+    in_record_region = (
+        losses.index <= last_record_index
+        if last_record_index is not None
+        else pd.Series(False, index=losses.index)
+    )
+    candidate_mask = (
+        identified | element_id.ne("") | severity.ne("")
+        | (in_record_region & losses[required].notna().any(axis=1))
+    )
     losses = losses[candidate_mask].copy()
     losses["Element_ID"] = losses["Element_ID"].apply(_excel_text)
 
