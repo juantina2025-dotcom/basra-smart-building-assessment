@@ -1962,6 +1962,10 @@ def load_uploaded_result_into_session(result):
         # Sync the separate AI assessment screen to this exact uploaded workbook.
         # This does not change the deterministic index equations or AHP weights.
         st.session_state["uploaded_complete_assessment"] = result
+        # Keep a non-widget flag: Streamlit may discard keyed AI widgets when
+        # navigating away from their page. Rehydrate them on the next AI visit.
+        st.session_state["ai_excel_pending_sync"] = True
+        st.session_state["ai_excel_input_selected"] = True
         # Newly validated complete workbooks become the active AI input source.
         st.session_state["ai_input_mode"] = "From uploaded Excel"
         st.session_state["ai_building_id"] = _excel_text(info.get("Building_ID"))
@@ -9357,11 +9361,32 @@ elif selected_mode == "AI Assessment from Existing Indices":
             st.session_state.pop(key, None)
 
     def _on_ai_input_mode_change():
-        if st.session_state["ai_input_mode"] == "Manual entry":
+        is_excel = st.session_state["ai_input_mode"] == "From uploaded Excel"
+        st.session_state["ai_excel_input_selected"] = is_excel
+        if not is_excel:
             _reset_ai_manual()
         else:
             _set_ai_fields_from_excel()
+            st.session_state["ai_excel_pending_sync"] = False
 
+    # This section is a separate Streamlit page. Widget keys can be cleaned
+    # up when leaving their page, while uploaded_complete_assessment persists.
+    # Restore values *before* the widgets are constructed, not afterwards.
+    if _excel_assessment is not None:
+        if st.session_state.get("ai_excel_pending_sync"):
+            st.session_state["ai_input_mode"] = "From uploaded Excel"
+            _set_ai_fields_from_excel()
+            st.session_state["ai_excel_pending_sync"] = False
+        elif st.session_state.get("ai_input_mode") == "From uploaded Excel" or (
+            "ai_input_mode" not in st.session_state and
+            st.session_state.get("ai_excel_input_selected", True)
+        ):
+            st.session_state["ai_input_mode"] = "From uploaded Excel"
+            # Only restore if Streamlit removed widgets during navigation;
+            # do not override user edits while still on the same page.
+            required = ("ai_building_id", "ai_di", "ai_pli", "ai_si", "ai_tri_status")
+            if any(key not in st.session_state for key in required):
+                _set_ai_fields_from_excel()
     if st.session_state.get("ai_input_mode") not in _input_options:
         st.session_state["ai_input_mode"] = _input_options[0]
     st.radio(
@@ -9375,6 +9400,9 @@ elif selected_mode == "AI Assessment from Existing Indices":
         st.info("Manual mode: enter building information and available indices yourself. No Excel upload is required.")
     else:
         st.success("Excel mode: fields were loaded from the last validated complete building assessment.")
+        if st.button("Reload all fields from validated Excel", key="ai_reload_from_excel"):
+            _set_ai_fields_from_excel()
+            st.rerun()
         if st.session_state.get("ai_excel_function_unmapped"):
             st.error("The building function in the uploaded workbook is not supported by the AI model: "
                      + st.session_state["ai_excel_function_unmapped"]
