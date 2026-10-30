@@ -28,6 +28,7 @@ try:
         TableStyle,
         Image as RLImage,
         HRFlowable,
+        KeepTogether,
     )
     from reportlab.lib.utils import ImageReader
     REPORTLAB_AVAILABLE = True
@@ -1946,6 +1947,9 @@ def load_uploaded_result_into_session(result):
             summary_data.items(),
             columns=["Assessment Item", "Value"],
         )
+        # Snapshot the breakdown with the completed report, separately from
+        # later index calculations in the same session.
+        st.session_state.latest_fai_calculation_results = result["fai_details"].copy()
         st.session_state.latest_calculated_fai = float(result["FAI"])
         st.session_state.latest_calculated_fai_class = result["FAI_Condition_Class"]
         st.session_state.latest_predicted_fai = None
@@ -1958,6 +1962,12 @@ def load_uploaded_result_into_session(result):
         st.session_state.latest_confirmed_critical_failures = list(
             result.get("Confirmed_Critical_Failures", [])
         )
+        # A new completed assessment must never inherit another report's comment.
+        st.session_state.latest_cf_assessor_comment = ""
+        st.session_state.pop("report_cf_assessor_comment", None)
+        st.session_state.latest_engineering_recommendations = ""
+        st.session_state.pop("report_engineering_recommendations", None)
+        _reset_assessment_report_details()
 
         # Sync the separate AI assessment screen to this exact uploaded workbook.
         # This does not change the deterministic index equations or AHP weights.
@@ -1994,6 +2004,87 @@ def load_uploaded_result_into_session(result):
 # ============================================================
 # PDF ASSESSMENT REPORT
 # ============================================================
+
+REPORT_DETAIL_WIDGET_FIELDS = {
+    "beneficiary_entity": "report_beneficiary_entity",
+    "assessing_entity": "report_assessing_entity",
+    "report_number": "report_number",
+    "inspection_name": "report_inspection_name",
+    "assessment_date": "report_assessment_date",
+    "assessor_name": "report_assessor_name",
+}
+
+
+def _reset_assessment_report_details():
+    """Start each completed building assessment with its own empty report details."""
+    st.session_state.latest_report_details = {}
+    for widget_key in REPORT_DETAIL_WIDGET_FIELDS.values():
+        st.session_state.pop(widget_key, None)
+
+
+CRITICAL_FAILURE_DEFINITIONS = {
+    "CF1": "Actual Partial or Total Collapse",
+    "CF2": "Structural Instability or Loss of Support",
+    "CF3": "Falling or Imminent Local Collapse Hazard",
+}
+
+
+def _critical_failure_report_rows(confirmed_critical_failures=None):
+    """Describe the recorded flags without inferring a cause from index scores."""
+    confirmed = set(confirmed_critical_failures or [])
+    return [
+        {
+            "Code": code,
+            "Critical Failure Indicator": title,
+            "Status": "Activated" if code in confirmed else "Not Activated",
+        }
+        for code, title in CRITICAL_FAILURE_DEFINITIONS.items()
+    ]
+
+
+def _report_safety_override_active(critical_failure_index, safety_status):
+    """Read saved safety fields for display styling; never alter the decision."""
+    try:
+        flag_is_active = float(critical_failure_index) == 1.0
+    except (TypeError, ValueError):
+        flag_is_active = False
+    return flag_is_active or str(safety_status).strip().lower() == "activated"
+
+
+def _recorded_safety_table_html(frame, override_active=False):
+    """Highlight only recorded status/result cells, keeping row labels neutral."""
+    safety_items = {"CRITICAL FAILURE INDEX", "SAFETY OVERRIDE STATUS", "FINAL DECISION"}
+    parts = [
+        '<div style="overflow-x:auto;margin-bottom:1rem;">',
+        '<table style="width:100%;border-collapse:collapse;font-size:0.95rem;">',
+        '<thead><tr style="background-color:#0F4C5C;color:#FFFFFF;">',
+    ]
+    for column in frame.columns:
+        parts.append(
+            '<th style="padding:0.6rem;border:1px solid #91B9B0;text-align:left;color:#FFFFFF;">'
+            + html.escape(str(column)) + '</th>'
+        )
+    parts.append('</tr></thead><tbody>')
+    for position, (_, row) in enumerate(frame.iterrows()):
+        row_background = "#FFFFFF" if position % 2 == 0 else "#F5F9F8"
+        parts.append(f'<tr style="background-color:{row_background};color:#153B43;">')
+        for column, value in row.items():
+            is_active_cell = (column == "Status" and value == "Activated") or (
+                column == "Result" and override_active
+                and row.get("Final Assessment Item") in safety_items
+            )
+            background = "#C00000" if is_active_cell else row_background
+            foreground = "#FFFFFF" if is_active_cell else "#153B43"
+            weight = "bold" if is_active_cell else "normal"
+            parts.append(
+                f'<td style="padding:0.6rem;border:1px solid #B9C8C5;vertical-align:top;'
+                f'background-color:{background};color:{foreground};font-weight:{weight};">'
+                + html.escape(_excel_text(value)) + '</td>'
+            )
+        parts.append('</tr>')
+    parts.append('</tbody></table></div>')
+    return ''.join(parts)
+
 
 def _assessment_summary_to_dict(summary_df):
     """Convert the two-column Results & Reports dataframe into a plain dict."""
@@ -2088,12 +2179,189 @@ def calculate_final_assessment_building_index(calculated_fai, ai_predicted_fai):
     return None, "Not Available"
 
 
+def _pdf_matching_fai_details(summary, fai_details, fai_scenario=None):
+    """Validate a saved FAI breakdown against this report without changing it."""
+    required_columns = {
+        "Index", "Index_Value", "Converted_Score",
+        "Applied_Weight", "FAI_Contribution",
+    }
+    if not isinstance(fai_details, pd.DataFrame):
+        return None
+    if not required_columns.issubset(fai_details.columns):
+        return None
+
+    reported_fai = _optional_fai_value(
+        summary.get("Calculated FAI", summary.get("FAI"))
+    )
+    if reported_fai is None or not np.isfinite(reported_fai):
+        return None
+
+    tri_value = _optional_fai_value(summary.get("TRI"))
+    tri_is_available = tri_value is not None and np.isfinite(tri_value)
+    weights = (
+        FULL_FAI_UPLOAD_WEIGHTS if tri_is_available
+        else NO_TRI_FAI_UPLOAD_WEIGHTS
+    )
+    expected_indices = {name for name, weight in weights.items() if weight > 0}
+    expected_scenario = (
+        "Full 4-Index Assessment" if tri_is_available
+        else "TRI Not Available – 3-Index Assessment"
+    )
+    saved_scenario = fai_scenario or summary.get("FAI Scenario")
+    if saved_scenario and str(saved_scenario) != expected_scenario:
+        return None
+
+    details = fai_details.copy(deep=True)
+    if (len(details) != len(expected_indices)
+            or details["Index"].duplicated().any()
+            or set(details["Index"]) != expected_indices):
+        return None
+
+    rows = []
+    total = 0.0
+    for name in ("DI", "PLI", "TRI", "SI"):
+        if name not in expected_indices:
+            continue
+        record = details.loc[details["Index"] == name].iloc[0]
+        try:
+            raw = float(record["Index_Value"])
+            score = float(record["Converted_Score"])
+            weight = float(record["Applied_Weight"])
+            contribution = float(record["FAI_Contribution"])
+        except (TypeError, ValueError):
+            return None
+        if not all(np.isfinite(v) for v in (raw, score, weight, contribution)):
+            return None
+        if not (0 <= raw <= 100 and 0 <= score <= 100 and 0 < weight <= 1):
+            return None
+        shown_raw = _optional_fai_value(summary.get(name))
+        if (shown_raw is None or not np.isfinite(shown_raw)
+                or round(raw, 2) != round(shown_raw, 2)):
+            return None
+        expected_score = 100.0 - raw if name in {"DI", "PLI"} else raw
+        if (abs(score - expected_score) > 1e-8
+                or abs(weight - float(weights[name])) > 1e-10
+                or abs(contribution - score * weight) > 1e-8):
+            return None
+        rows.append({
+            "Index": name,
+            "Converted_Score": score,
+            "Applied_Weight": weight,
+            "Weighted_Shortfall": weight * (100.0 - score),
+        })
+        total += contribution
+
+    total = max(0.0, min(100.0, total))
+    if round(total, 2) != round(reported_fai, 2):
+        return None
+    return {"FAI": total, "Rows": rows}
+
+
+def _pdf_assessment_interpretation(summary, calculated_fai, matching_details):
+    """Explain the existing weighted result; do not diagnose physical causes."""
+    paragraphs = []
+    if calculated_fai is not None and np.isfinite(calculated_fai):
+        condition = get_fai_class(calculated_fai)
+        bounds = {
+            "Good": "70 ≤ FAI ≤ 100",
+            "Moderate": "55 ≤ FAI < 70",
+            "Poor": "40 ≤ FAI < 55",
+            "Critical": "0 ≤ FAI < 40",
+        }
+        paragraphs.append(
+            f"The calculated FAI is {calculated_fai:.2f}, corresponding to the "
+            f"{condition} category ({bounds[condition]})."
+        )
+        if get_fai_class(round(calculated_fai, 2)) != condition:
+            unrounded_text = f"{calculated_fai:.12g}"
+            if get_fai_class(float(unrounded_text)) != condition:
+                unrounded_text = repr(calculated_fai)
+            paragraphs[-1] += (
+                " The class is determined before display rounding "
+                f"(unrounded FAI = {unrounded_text})."
+            )
+    else:
+        paragraphs.append(
+            "The calculated FAI is not available; a numerical MCDA condition "
+            "class cannot be interpreted."
+        )
+
+    if matching_details is not None:
+        rows = matching_details["Rows"]
+        scores = {row["Index"]: row["Converted_Score"] for row in rows}
+        benefit_text = f"SI = {scores['SI']:.2f} is a benefit score."
+        if "TRI" in scores:
+            benefit_text = (
+                f"TRI = {scores['TRI']:.2f} and SI = {scores['SI']:.2f} "
+                "are benefit scores."
+            )
+        paragraphs.append(
+            "DI and PLI are adverse indices: their benefit-oriented scores are "
+            f"100 - DI = {scores['DI']:.2f} and 100 - PLI = {scores['PLI']:.2f}. "
+            + benefit_text + " Higher benefit scores increase FAI."
+        )
+        largest_shortfall = max(row["Weighted_Shortfall"] for row in rows)
+        if largest_shortfall <= 1e-10:
+            paragraphs.append(
+                "All included indicators attain the maximum benefit score; "
+                "there is no weighted shortfall from 100."
+            )
+        else:
+            leaders = [
+                row for row in rows
+                if abs(row["Weighted_Shortfall"] - largest_shortfall) <= 1e-10
+            ]
+            if len(leaders) == 1:
+                leader = leaders[0]
+                paragraphs.append(
+                    f"{leader['Index']} has the largest weighted shortfall "
+                    f"from 100: {largest_shortfall:.2f} FAI points "
+                    f"(applied weight {leader['Applied_Weight']:.2%}). "
+                    "Shortfall = weight x (100 - benefit score)."
+                )
+            else:
+                names = ", ".join(row["Index"] for row in leaders[:-1])
+                names += " and " + leaders[-1]["Index"]
+                paragraphs.append(
+                    f"{names} share the largest weighted shortfall from 100 "
+                    f"({largest_shortfall:.2f} FAI points each). "
+                    "Shortfall = weight x (100 - benefit score)."
+                )
+    elif calculated_fai is not None and np.isfinite(calculated_fai):
+        paragraphs.append(
+            "A matching weighted contribution breakdown is unavailable; "
+            "the main indicator influence cannot be identified."
+        )
+
+    safety_status = str(summary.get("Safety Override Status", "")).strip().lower()
+    if safety_status == "activated":
+        paragraphs.append(
+            "The Safety Override is activated. The recorded safety decision "
+            "applies independently of the numerical FAI and does not change its value."
+        )
+    elif safety_status == "not activated":
+        paragraphs.append(
+            "The Safety Override is not activated. This status is reported "
+            "independently of the numerical FAI and does not change its value."
+        )
+    else:
+        paragraphs.append(
+            "The safety decision is reported independently of the numerical FAI "
+            "and does not change its value."
+        )
+    return paragraphs
+
+
 def build_assessment_pdf(
     summary_df,
     result_source=None,
     fai_scenario=None,
     confirmed_critical_failures=None,
     assessor_name=None,
+    fai_details=None,
+    cf_assessor_comment=None,
+    engineering_recommendations=None,
+    report_details=None,
 ):
     """
     Build a concise A4 PDF report from the latest completed assessment.
@@ -2115,7 +2383,7 @@ def build_assessment_pdf(
         rightMargin=16 * mm,
         leftMargin=16 * mm,
         topMargin=14 * mm,
-        bottomMargin=17 * mm,
+        bottomMargin=18 * mm,
         title="Building Assessment Summary Report",
         author="Smart Assessment Model - University of Basra",
         subject="Existing Building Assessment Summary",
@@ -2149,8 +2417,8 @@ def build_assessment_pdf(
         fontSize=11,
         leading=14,
         textColor=colors.HexColor("#0F4C5C"),
-        spaceBefore=7,
-        spaceAfter=5,
+        spaceBefore=5,
+        spaceAfter=4,
     )
     body_style = ParagraphStyle(
         "AssessmentBody",
@@ -2191,30 +2459,47 @@ def build_assessment_pdf(
     story.append(Paragraph("SMART ASSESSMENT MODEL FOR EXISTING BUILDINGS", title_style))
     story.append(Paragraph("IN URBAN AREAS OF BASRA GOVERNORATE", subtitle_style))
     story.append(Paragraph("BUILDING ASSESSMENT SUMMARY REPORT", subtitle_style))
-    story.append(Spacer(1, 3 * mm))
+    story.append(Spacer(1, 2 * mm))
     story.append(HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#91B9B0")))
-    story.append(Spacer(1, 3 * mm))
+    story.append(Spacer(1, 2 * mm))
 
-    report_date = datetime.now().strftime("%d %B %Y")
-    story.append(
-        Table(
-            [
-                [Paragraph("<b>Report Date</b>", body_style), Paragraph(_pdf_safe_text(report_date), body_style)],
-                [Paragraph("<b>Result Source</b>", body_style), Paragraph(_pdf_safe_text(result_source or summary.get("Result Source")), body_style)],
-            ],
-            colWidths=[44 * mm, 132 * mm],
-            style=TableStyle([
-                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E8F3F0")),
-                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
-                ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ]),
-        )
+    # Report details are supplied by the assessor, including the actual
+    # assessment date. Never substitute the PDF generation date for that date.
+    report_details = dict(report_details) if isinstance(report_details, dict) else {}
+
+    def detail_value(field):
+        value = report_details.get(field)
+        if field == "assessment_date" and hasattr(value, "strftime"):
+            value = value.strftime("%d/%m/%Y")
+        text = _excel_text(value)
+        return _pdf_safe_text(text) if text else "________________________"
+
+    metadata_rows = [
+        ["Beneficiary Entity", detail_value("beneficiary_entity"),
+         "Assessing Entity", detail_value("assessing_entity")],
+        ["Report No.", detail_value("report_number"),
+         "Inspection Name", detail_value("inspection_name")],
+        ["Assessment Date", detail_value("assessment_date"),
+         "Result Source", _pdf_safe_text(result_source or summary.get("Result Source"))],
+    ]
+    metadata_table = Table(
+        [[Paragraph(f"<b>{row[0]}</b>", body_style), Paragraph(row[1], body_style),
+          Paragraph(f"<b>{row[2]}</b>", body_style), Paragraph(row[3], body_style)]
+         for row in metadata_rows],
+        colWidths=[34 * mm, 54 * mm, 34 * mm, 54 * mm],
+        style=TableStyle([
+            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E8F3F0")),
+            ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#E8F3F0")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]),
     )
+    story.append(KeepTogether([metadata_table]))
 
     story.append(Paragraph("Building Information", section_style))
     building_rows = [
@@ -2245,8 +2530,8 @@ def build_assessment_pdf(
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
             ]),
         )
     )
@@ -2259,15 +2544,32 @@ def build_assessment_pdf(
         ["Physical Loss Level (PLI)", _pdf_number(summary.get("PLI"))],
         ["Test Result Level (TRI)", _pdf_number(summary.get("TRI"))],
         ["Sustainability Level (SI)", _pdf_number(summary.get("SI"))],
-        ["Calculated FAI (MCDA)", _pdf_number(calculated_fai_value)],
-        ["AI-Predicted FAI (Random Forest)", _pdf_number(predicted_fai_value)],
     ]
+    # Step 4: explain the saved no-test scenario directly below the TRI label.
+    # This is a reporting note only; it does not modify any index or FAI weight.
+    recorded_fai_for_note = _optional_fai_value(calculated_fai_value)
+    tri_without_tests = (
+        _optional_fai_value(summary.get("TRI")) is None
+        and (fai_scenario or summary.get("FAI Scenario"))
+        == "TRI Not Available – 3-Index Assessment"
+        and recorded_fai_for_note is not None
+        and np.isfinite(recorded_fai_for_note)
+    )
     index_table_data = [
         [Paragraph("<b>Level</b>", body_style), Paragraph("<b>Value</b>", body_style)]
-    ] + [
-        [Paragraph(_pdf_safe_text(label), body_style), Paragraph(_pdf_safe_text(value), body_style)]
-        for label, value in index_rows
     ]
+    for label, value in index_rows:
+        label_text = _pdf_safe_text(label)
+        if label == "Test Result Level (TRI)" and tri_without_tests:
+            label_text += (
+                '<br/><font size="7.5" color="#555555">'
+                'FAI was calculated using the approved three-index scenario '
+                'without test results.</font>'
+            )
+        index_table_data.append([
+            Paragraph(label_text, body_style),
+            Paragraph(_pdf_safe_text(value), body_style),
+        ])
     story.append(
         Table(
             index_table_data,
@@ -2282,13 +2584,18 @@ def build_assessment_pdf(
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
             ]),
         )
     )
 
+    # Use the matching saved breakdown to classify the unrounded MCDA FAI.
+    # Only the displayed numerical value is rounded.
+    matching_fai_details = _pdf_matching_fai_details(summary, fai_details, fai_scenario)
     calculated_fai_numeric = _optional_fai_value(calculated_fai_value)
+    if matching_fai_details is not None:
+        calculated_fai_numeric = matching_fai_details["FAI"]
     predicted_fai_numeric = _optional_fai_value(predicted_fai_value)
     calculated_condition = (
         get_fai_class(calculated_fai_numeric)
@@ -2300,52 +2607,113 @@ def build_assessment_pdf(
         if predicted_fai_numeric is not None
         else "Not Available"
     )
+    # The AI condition stored with the prediction was determined before
+    # rounding its displayed value; retain that recorded class when available.
+    saved_predicted_condition = str(summary.get("AI-Predicted FAI Condition", "")).strip()
+    if predicted_fai_numeric is not None and saved_predicted_condition in {
+        "Good", "Moderate", "Poor", "Critical"
+    }:
+        predicted_condition = saved_predicted_condition
     critical_failure_index = summary.get(
         "Critical Failure Index",
         summary.get("Critical Failure Flag"),
     )
+    safety_status = summary.get("Safety Override Status")
+    safety_highlight_active = _report_safety_override_active(critical_failure_index, safety_status)
+    safety_row_labels = {"CRITICAL FAILURE INDEX", "SAFETY OVERRIDE STATUS", "FINAL DECISION"}
 
-    story.append(Paragraph("Final Assessment", section_style))
     final_rows = [
+        ["CALCULATED FAI (MCDA)", _pdf_number(calculated_fai_value)],
         ["CALCULATED FAI CONDITION", calculated_condition],
+        ["AI-PREDICTED FAI (RANDOM FOREST)", _pdf_number(predicted_fai_value)],
         ["AI-PREDICTED FAI CONDITION", predicted_condition],
         ["CRITICAL FAILURE INDEX", critical_failure_index],
-        ["SAFETY OVERRIDE STATUS", summary.get("Safety Override Status")],
+        ["SAFETY OVERRIDE STATUS", safety_status],
         ["FINAL DECISION", summary.get("Final Decision")],
     ]
-    final_table_data = []
-    for idx, (label, value) in enumerate(final_rows):
-        if idx == 0:
-            label_paragraph = Paragraph(
-                f'<font color="#FFFFFF"><b>{_pdf_safe_text(label)}</b></font>',
-                body_style,
-            )
-            value_paragraph = Paragraph(
-                f'<font color="#FFFFFF"><b>{_pdf_safe_text(value)}</b></font>',
-                body_style,
-            )
+    final_table_data = [[
+        Paragraph('<font color="#FFFFFF"><b>Assessment Item</b></font>', body_style),
+        Paragraph('<font color="#FFFFFF"><b>Result</b></font>', body_style),
+    ]]
+    final_table_commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F4C5C")),
+        ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#E8F3F0")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#91B9B0")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+    ]
+    for row_number, (label, value) in enumerate(final_rows, start=1):
+        label_markup = f"<b>{_pdf_safe_text(label)}</b>"
+        if safety_highlight_active and label in safety_row_labels:
+            value_markup = f'<font color="#FFFFFF"><b>{_pdf_safe_text(value)}</b></font>'
+            final_table_commands.append((
+                "BACKGROUND", (1, row_number), (1, row_number), colors.HexColor("#C00000")
+            ))
         else:
-            label_paragraph = Paragraph(f"<b>{_pdf_safe_text(label)}</b>", body_style)
-            value_paragraph = Paragraph(_pdf_safe_text(value), body_style)
-        final_table_data.append([label_paragraph, value_paragraph])
+            value_markup = _pdf_safe_text(value)
+        final_table_data.append([
+            Paragraph(label_markup, body_style), Paragraph(value_markup, body_style)
+        ])
     final_table = Table(
         final_table_data,
-        colWidths=[88 * mm, 88 * mm],
+        colWidths=[100 * mm, 76 * mm],
+        repeatRows=1,
+        style=TableStyle(final_table_commands),
+    )
+    story.append(KeepTogether([
+        Paragraph("Final FAI Assessment and Safety Decision", section_style), final_table,
+    ]))
+
+
+    # Step 1: display the study's existing numerical FAI class boundaries.
+    # This reference table does not alter indices, weights or safety decisions.
+    classification_limits = [
+        ("Good", "70 ≤ FAI ≤ 100"),
+        ("Moderate", "55 ≤ FAI < 70"),
+        ("Poor", "40 ≤ FAI < 55"),
+        ("Critical", "0 ≤ FAI < 40"),
+    ]
+    classification_table_data = [
+        [Paragraph('<font color="#FFFFFF"><b>Classification</b></font>', body_style)]
+        + [
+            Paragraph(
+                '<font color="#FFFFFF"><b>' + _pdf_safe_text(label) + '</b></font>',
+                body_style,
+            )
+            for label, _ in classification_limits
+        ],
+        [Paragraph("<b>FAI range</b>", body_style)]
+        + [Paragraph(_pdf_safe_text(bounds), body_style)
+           for _, bounds in classification_limits],
+    ]
+    classification_table = Table(
+        classification_table_data,
+        colWidths=[38 * mm] + [34.5 * mm] * 4,
         style=TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F4C5C")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#E8F3F0")),
-            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#91B9B0")),
+            ("BACKGROUND", (0, 1), (0, 1), colors.HexColor("#E8F3F0")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
             ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ALIGN", (1, 0), (1, -1), "CENTER"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
         ]),
     )
-    story.append(final_table)
+    story.append(KeepTogether([
+        Paragraph("FAI Classification Limits", section_style),
+        classification_table,
+        Spacer(1, 1 * mm),
+        Paragraph(
+            "Classification limits adopted in this study; ranges refer to unrounded FAI values.",
+            center_small_style,
+        ),
+    ]))
     story.append(Spacer(1, 2 * mm))
     story.append(
         Paragraph(
@@ -2355,57 +2723,145 @@ def build_assessment_pdf(
         )
     )
 
-    confirmed_critical_failures = confirmed_critical_failures or []
-    if confirmed_critical_failures:
-        story.append(Spacer(1, 3 * mm))
-        story.append(
-            Table(
-                [[Paragraph(
-                    "<b>Confirmed Critical Failure Codes:</b> "
-                    + _pdf_safe_text(", ".join(confirmed_critical_failures)),
-                    body_style,
-                )]],
-                colWidths=[176 * mm],
-                style=TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FCE8E6")),
-                    ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#C00000")),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 7),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-                    ("TOPPADDING", (0, 0), (-1, -1), 6),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ]),
-            )
-        )
+    # Step 3: list every CF definition and its recorded activation state.
+    # The only narrative here is the assessor's own manually entered comment.
+    cf_rows = _critical_failure_report_rows(confirmed_critical_failures)
+    cf_table_data = [[
+        Paragraph("Code", body_bold_style),
+        Paragraph("Critical Failure Indicator", body_bold_style),
+        Paragraph("Status", body_bold_style),
+    ]]
+    cf_table_commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8F2F0")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B9C8C5")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]
+    for row_number, row in enumerate(cf_rows, start=1):
+        is_active = row["Status"] == "Activated"
+        cells = []
+        for key in ("Code", "Critical Failure Indicator", "Status"):
+            text = _pdf_safe_text(row[key])
+            if is_active and key == "Status":
+                text = f'<font color="#FFFFFF"><b>{text}</b></font>'
+            cells.append(Paragraph(text, body_bold_style if key == "Code" else body_style))
+        cf_table_data.append(cells)
+        if is_active:
+            cf_table_commands.append((
+                "BACKGROUND", (2, row_number), (2, row_number),
+                colors.HexColor("#C00000"),
+            ))
+    cf_table = Table(
+        cf_table_data,
+        colWidths=[18 * mm, 125 * mm, 33 * mm],
+        repeatRows=1,
+        hAlign="LEFT",
+        style=TableStyle(cf_table_commands),
+    )
+    story.append(KeepTogether([
+        Spacer(1, 2 * mm),
+        Paragraph("Critical Failure Assessment", section_style),
+        cf_table,
+    ]))
 
-    story.append(Spacer(1, 2 * mm))
-    assessor_display = (str(assessor_name).strip() if assessor_name else "")
+    comment_text = str(cf_assessor_comment or "").strip()
+    comment_heading = Paragraph("Assessor Comment", body_bold_style)
+    if comment_text:
+        # Escape ReportLab markup while retaining manually entered line breaks.
+        comment_text = comment_text.replace("\r\n", "\n").replace("\r", "\n")
+        comment_paragraph = Paragraph(
+            html.escape(comment_text).replace("\n", "<br/>"), body_style
+        )
+        story.append(KeepTogether([Spacer(1, 2 * mm), comment_heading]))
+        story.append(comment_paragraph)
+    else:
+        # Leave three writable lines when the assessor has entered no comment.
+        blank_comment_lines = Table(
+            [[""], [""], [""]],
+            colWidths=[176 * mm],
+            rowHeights=[7 * mm, 7 * mm, 7 * mm],
+            hAlign="LEFT",
+            style=TableStyle([
+                ("LINEBELOW", (0, 0), (-1, -1), 0.35, colors.HexColor("#9BA9A6")),
+            ]),
+        )
+        story.append(KeepTogether([
+            Spacer(1, 2 * mm), comment_heading, blank_comment_lines,
+        ]))
+
+    # Step 5: recommendations come only from the assessor's manual entry.
+    # They are report text and never become model inputs or calculation rules.
+    recommendations_text = str(engineering_recommendations or "").strip()
+    recommendations_heading = Paragraph("Engineering Recommendations", section_style)
+    if recommendations_text:
+        recommendations_text = recommendations_text.replace("\r\n", "\n").replace("\r", "\n")
+        story.append(Spacer(1, 2 * mm))
+        story.append(recommendations_heading)
+        story.append(Paragraph(
+            html.escape(recommendations_text).replace("\n", "<br/>"), body_style
+        ))
+    else:
+        blank_recommendation_lines = Table(
+            [[""], [""], [""]],
+            colWidths=[176 * mm],
+            rowHeights=[7 * mm, 7 * mm, 7 * mm],
+            hAlign="LEFT",
+            style=TableStyle([
+                ("LINEBELOW", (0, 0), (-1, -1), 0.35, colors.HexColor("#9BA9A6")),
+            ]),
+        )
+        story.append(KeepTogether([
+            Spacer(1, 2 * mm), recommendations_heading, blank_recommendation_lines,
+        ]))
+
+    assessor_display = _excel_text(assessor_name or report_details.get("assessor_name"))
     if not assessor_display:
         assessor_display = "____________________________"
+    signature_table = Table(
+        [
+            [Paragraph("<b>Assessor Name</b>", body_style),
+             Paragraph(_pdf_safe_text(assessor_display), body_style)],
+            [Paragraph("<b>Signature</b>", body_style),
+             Paragraph("____________________________", body_style)],
+        ],
+        colWidths=[32 * mm, 68 * mm],
+        hAlign="RIGHT",
+        style=TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]),
+    )
+    # This block follows all report content and appears only at the end.
+    story.append(KeepTogether([Spacer(1, 6 * mm), signature_table]))
 
-    # Assessor and signature are drawn in the lower-right page area instead of
-    # being part of the flowing story. This prevents the signature line from
-    # being pushed onto a second page when the report nearly fills page 1.
+    # Only continuation identification and page numbering repeat on each page.
 
     def _draw_footer(canvas, document):
         canvas.saveState()
-        page_width, _ = A4
+        page_width, page_height = A4
 
-        # Assessor block - lower right, above the footer rule.
-        # The assessment report is intentionally designed as a concise one-page
-        # summary, so this keeps the assessor name and signature together.
-        if document.page == 1:
-            canvas.setFillColor(colors.HexColor("#111111"))
-            canvas.setFont("Helvetica-Bold", 8.5)
-            canvas.drawRightString(
-                page_width - 16 * mm,
-                23.0 * mm,
-                "ASSESSOR: " + assessor_display,
+        if document.page > 1:
+            continuation_style = ParagraphStyle(
+                "AssessmentContinuation", parent=body_style,
+                fontSize=8, leading=9, textColor=colors.HexColor("#0F4C5C"),
             )
-            canvas.drawRightString(
-                page_width - 16 * mm,
-                17.5 * mm,
-                "SIGNATURE: ____________________________",
+            continuation = Paragraph(
+                "<b>BUILDING ASSESSMENT SUMMARY REPORT</b> | Building ID: "
+                + _pdf_safe_text(summary.get("Building ID")),
+                continuation_style,
             )
+            continuation.wrap(176 * mm, 20 * mm)
+            continuation.drawOn(canvas, 16 * mm, page_height - 12 * mm)
+            canvas.setStrokeColor(colors.HexColor("#91B9B0"))
+            canvas.setLineWidth(0.4)
+            canvas.line(16 * mm, page_height - 13 * mm,
+                        page_width - 16 * mm, page_height - 13 * mm)
 
         canvas.setStrokeColor(colors.HexColor("#D9D9D9"))
         canvas.setLineWidth(0.4)
@@ -2452,7 +2908,7 @@ SESSION_DEFAULTS = {
 
     "latest_building_condition": None,
 
-    "report_assessor_name": "",
+    "latest_report_details": {},
 
     "latest_final_decision": None,
 
@@ -2460,7 +2916,13 @@ SESSION_DEFAULTS = {
 
     "latest_fai_scenario": None,
 
+    "latest_fai_calculation_results": None,
+
     "latest_confirmed_critical_failures": [],
+
+    "latest_cf_assessor_comment": "",
+
+    "latest_engineering_recommendations": "",
 
     "calculated_di": None,
 
@@ -9072,6 +9534,26 @@ elif selected_mode == "Results & Reports":
 
     else:
 
+        st.subheader("Report Details")
+        saved_report_details = st.session_state.get("latest_report_details") or {}
+        for field, widget_key in REPORT_DETAIL_WIDGET_FIELDS.items():
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = saved_report_details.get(
+                    field, None if field == "assessment_date" else ""
+                )
+        details_left, details_right = st.columns(2)
+        with details_left:
+            st.text_input("Beneficiary Entity", key="report_beneficiary_entity")
+            st.text_input("Report No.", key="report_number")
+            st.date_input(
+                "Assessment Date", key="report_assessment_date", value=None,
+                format="DD/MM/YYYY",
+            )
+        with details_right:
+            st.text_input("Assessing Entity", key="report_assessing_entity")
+            st.text_input("Inspection Name", key="report_inspection_name")
+        st.divider()
+
         st.dataframe(
 
             st.session_state.latest_assessment_summary,
@@ -9143,13 +9625,13 @@ elif selected_mode == "Results & Reports":
             "Not Available",
         )
 
-        st.subheader("Final Assessment")
+        st.subheader("Final FAI Assessment and Safety Decision")
         final_assessment_display = pd.DataFrame(
             [
-                ["CALCULATED FAI",
+                ["CALCULATED FAI (MCDA)",
                  f"{float(calculated_report_fai):.2f}" if calculated_report_fai is not None else "Not Available"],
                 ["CALCULATED FAI CONDITION", calculated_report_condition],
-                ["AI-PREDICTED FAI",
+                ["AI-PREDICTED FAI (RANDOM FOREST)",
                  f"{float(ai_report_fai):.2f}" if ai_report_fai is not None else "Not Available"],
                 ["AI-PREDICTED FAI CONDITION", ai_report_condition],
                 ["CRITICAL FAILURE INDEX", critical_failure_index],
@@ -9158,15 +9640,52 @@ elif selected_mode == "Results & Reports":
             ],
             columns=["Final Assessment Item", "Result"],
         )
-        st.dataframe(
-            final_assessment_display,
-            use_container_width=True,
-            hide_index=True,
+        st.markdown(
+            _recorded_safety_table_html(
+                final_assessment_display,
+                override_active=_report_safety_override_active(
+                    critical_failure_index, safety_status_for_report
+                ),
+            ),
+            unsafe_allow_html=True,
         )
         st.caption(
             "Calculated FAI and AI-Predicted FAI are reported independently. "
             "No arithmetic mean or fused FAI is calculated."
         )
+
+        st.subheader("Critical Failure Assessment")
+        st.markdown(
+            _recorded_safety_table_html(pd.DataFrame(_critical_failure_report_rows(
+                st.session_state.get("latest_confirmed_critical_failures", [])
+            ))),
+            unsafe_allow_html=True,
+        )
+        # Keep the comment outside the widget key so it survives page navigation.
+        if "report_cf_assessor_comment" not in st.session_state:
+            st.session_state["report_cf_assessor_comment"] = st.session_state.get(
+                "latest_cf_assessor_comment", ""
+            )
+        cf_assessor_comment = st.text_area(
+            "Assessor Comment",
+            key="report_cf_assessor_comment",
+            height=130,
+            placeholder="Enter your comment on the critical failure assessment here.",
+        )
+        st.session_state.latest_cf_assessor_comment = cf_assessor_comment
+
+        # This manual field belongs to the latest completed building assessment.
+        if "report_engineering_recommendations" not in st.session_state:
+            st.session_state["report_engineering_recommendations"] = st.session_state.get(
+                "latest_engineering_recommendations", ""
+            )
+        engineering_recommendations = st.text_area(
+            "Engineering Recommendations",
+            key="report_engineering_recommendations",
+            height=150,
+            placeholder="Enter your engineering recommendations for this building.",
+        )
+        st.session_state.latest_engineering_recommendations = engineering_recommendations
 
         _, assessor_col = st.columns([2, 1])
         with assessor_col:
@@ -9176,6 +9695,10 @@ elif selected_mode == "Results & Reports":
                 placeholder="Enter assessor name for the PDF report",
             )
             st.markdown("**Signature:** __________________________")
+        st.session_state.latest_report_details = {
+            field: st.session_state.get(widget_key)
+            for field, widget_key in REPORT_DETAIL_WIDGET_FIELDS.items()
+        }
 
         st.caption(
             "Result source: "
@@ -9185,10 +9708,13 @@ elif selected_mode == "Results & Reports":
         st.divider()
         st.subheader("PDF Assessment Report")
         st.caption(
-            "Download a dated summary report containing building information, "
+            "Download a report containing the entered report details and assessment date, "
+            "building information, "
             "Calculated FAI and its condition, AI-Predicted FAI and its condition, "
             "Critical Failure Index, Safety Override Status, "
-            "Final Decision, assessor name, and signature field."
+            "all three CF indicators and their titles, the assessor comment, "
+            "manually entered engineering recommendations, "
+            "Final Decision, and the assessor name and signature field at the end."
         )
 
         if REPORTLAB_AVAILABLE:
@@ -9204,6 +9730,12 @@ elif selected_mode == "Results & Reports":
                         "latest_confirmed_critical_failures", []
                     ),
                     assessor_name=st.session_state.get("report_assessor_name", ""),
+                    fai_details=st.session_state.get("latest_fai_calculation_results"),
+                    cf_assessor_comment=st.session_state.get("latest_cf_assessor_comment", ""),
+                    engineering_recommendations=st.session_state.get(
+                        "latest_engineering_recommendations", ""
+                    ),
+                    report_details=st.session_state.get("latest_report_details", {}),
                 )
 
                 st.download_button(
@@ -10176,6 +10708,8 @@ elif selected_mode == "AI Assessment from Existing Indices":
             st.session_state.latest_assessment_summary = (
                 summary_df
             )
+            # Keep the report interpretation paired with this assessment.
+            st.session_state.latest_fai_calculation_results = calculated_fai_details.copy()
 
 
             st.session_state.latest_calculated_fai = (
@@ -10250,6 +10784,12 @@ elif selected_mode == "AI Assessment from Existing Indices":
                 }.items()
                 if int(flag) == 1
             ]
+            # Reset only when a new assessment is successfully completed.
+            st.session_state.latest_cf_assessor_comment = ""
+            st.session_state.pop("report_cf_assessor_comment", None)
+            st.session_state.latest_engineering_recommendations = ""
+            st.session_state.pop("report_engineering_recommendations", None)
+            _reset_assessment_report_details()
 
 
         except Exception as e:
