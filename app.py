@@ -28,7 +28,6 @@ try:
         TableStyle,
         Image as RLImage,
         HRFlowable,
-        KeepTogether,
     )
     from reportlab.lib.utils import ImageReader
     REPORTLAB_AVAILABLE = True
@@ -1018,6 +1017,545 @@ def _read_table(excel_file, sheet_name):
     return table
 
 
+def _read_upload_ahp_weights(excel_file, system):
+    """Use a validated workbook AHP table; defaults apply only if it is absent."""
+    system = _normalize_structural_system(system)
+    if "AHP_Element_Weights" not in excel_file.sheet_names:
+        return (
+            AHP_ELEMENT_WEIGHTS[system]["weights"].copy(),
+            "Application defaults (AHP_Element_Weights sheet absent)",
+            [],
+        )
+
+    table = _read_table(excel_file, "AHP_Element_Weights").copy()
+    required = ["Structural_System", "Element_Type", "Category_AHP_Weight"]
+    missing = [column for column in required if column not in table.columns]
+    if missing:
+        raise ValueError(
+            "AHP_Element_Weights is missing required columns: " + ", ".join(missing)
+        )
+    aliases = {
+        "Reinforced Concrete (RC)": "RC",
+        "Traditional / Heritage Masonry": "Traditional/Heritage Masonry",
+        "Traditional Heritage Masonry": "Traditional/Heritage Masonry",
+    }
+    source_systems = table["Structural_System"].apply(_excel_text).replace(aliases)
+    selected = table.loc[source_systems == system].copy()
+    if selected.empty:
+        raise ValueError(
+            f"AHP_Element_Weights contains no category weights for {system}."
+        )
+    selected["Element_Type"] = selected["Element_Type"].apply(_excel_text)
+    if (selected["Element_Type"] == "").any():
+        raise ValueError(
+            f"AHP_Element_Weights contains an empty Element_Type for {system}."
+        )
+    duplicated = selected.loc[
+        selected["Element_Type"].duplicated(keep=False), "Element_Type"
+    ].tolist()
+    if duplicated:
+        raise ValueError(
+            f"AHP_Element_Weights contains duplicate categories for {system}: "
+            + ", ".join(sorted(set(duplicated)))
+        )
+    values = pd.to_numeric(selected["Category_AHP_Weight"], errors="coerce")
+    boolean_values = selected["Category_AHP_Weight"].map(
+        lambda value: isinstance(value, (bool, np.bool_))
+    )
+    invalid = values.isna() | ~np.isfinite(values) | (values <= 0) | boolean_values
+    if invalid.any():
+        raise ValueError(
+            "AHP_Element_Weights requires a finite positive numeric weight for: "
+            + ", ".join(selected.loc[invalid, "Element_Type"].tolist())
+        )
+    weights = dict(zip(selected["Element_Type"], values.astype(float)))
+    warnings = []
+    defaults = AHP_ELEMENT_WEIGHTS[system]["weights"]
+    if set(weights) != set(defaults) or any(
+        not np.isclose(value, defaults.get(category, np.nan), rtol=0.0, atol=1e-12)
+        for category, value in weights.items()
+    ):
+        warnings.append(
+            f"The workbook supplies its own AHP category weights for {system}; "
+            "these values are used consistently for DI, PLI, and TRI."
+        )
+    weight_sum = float(sum(weights.values()))
+    if not np.isfinite(weight_sum):
+        raise ValueError("AHP_Element_Weights category weight total must be finite.")
+    if not np.isclose(weight_sum, 1.0, rtol=0.0, atol=1e-3):
+        warnings.append(
+            f"The supplied {system} AHP category weights total {weight_sum:.12g}. "
+            "Index calculations normalize the weights of the applicable categories."
+        )
+    return weights, f"Workbook AHP_Element_Weights ({system})", warnings
+
+
+def _compare_saved_excel(excel_file, info, result):
+    """Compare cached export values for review without using them as inputs."""
+    columns = ["Index", "Saved Excel", "Recomputed B01", "Difference", "Status"]
+    comparison = pd.DataFrame(columns=columns)
+    comparison.attrs["saved_sources"] = {}
+    comparison.attrs["warnings"] = []
+    if "App_Export" not in excel_file.sheet_names:
+        return comparison
+
+    export = _read_table(excel_file, "App_Export")
+    building_id = _excel_text(info.get("Building_ID"))
+    saved_row = None
+    if building_id and "Building_ID" in export.columns:
+        matches = export.loc[export["Building_ID"].apply(_excel_text) == building_id]
+        if len(matches) == 1:
+            saved_row = matches.iloc[0]
+        else:
+            comparison.attrs["warnings"].append(
+                f"App_Export has {len(matches)} rows matching Building_ID {building_id}; "
+                "saved values cannot be compared unambiguously."
+            )
+    elif len(export) > 0:
+        # Templates without an identifier store their one export row at row 4.
+        saved_row = export.iloc[0]
+
+    def finite_number(value):
+        if isinstance(value, (bool, np.bool_)):
+            return None
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.isna(numeric) or not np.isfinite(numeric):
+            return None
+        return float(numeric)
+
+    rows = []
+    saved_sources = comparison.attrs["saved_sources"]
+    for index_name in ["DI", "PLI", "TRI", "SI", "FAI"]:
+        if index_name not in result:
+            continue
+        source_column = index_name
+        convert_benefit = False
+        if index_name == "PLI":
+            raw_columns = ["PLI_Raw_Loss", "PLI"]
+            benefit_columns = ["PLI_Benefit_Score", "PLI_Benefit"]
+            source_column = next((name for name in raw_columns if name in export.columns), None)
+            if source_column is None:
+                source_column = next(
+                    (name for name in benefit_columns if name in export.columns), None
+                )
+                convert_benefit = source_column is not None
+        source_exists = saved_row is not None and source_column in export.columns
+        saved = saved_row[source_column] if source_exists else None
+        saved_numeric = finite_number(saved)
+        if convert_benefit and saved_numeric is not None:
+            saved_numeric = 100.0 - saved_numeric
+        if source_column is not None:
+            if index_name == "PLI":
+                saved_sources[index_name] = (
+                    f"100 - App_Export.{source_column} (converted to raw loss)"
+                    if convert_benefit else f"App_Export.{source_column} (raw loss)"
+                )
+            else:
+                saved_sources[index_name] = f"App_Export.{source_column}"
+
+        recalculated = finite_number(result.get(index_name))
+        if index_name == "TRI" and result.get("TRI_Availability_Flag") == 0:
+            recalculated = None
+        difference = None
+        if not source_exists or _excel_text(saved) == "":
+            status = "Missing saved value"
+        elif saved_numeric is None or recalculated is None:
+            status = "Unavailable" if saved_numeric is None and recalculated is None else "Different"
+        else:
+            difference = recalculated - saved_numeric
+            status = "Match" if abs(difference) <= 1e-8 else "Different"
+        rows.append({
+            "Index": index_name,
+            "Saved Excel": saved_numeric if saved_numeric is not None else _excel_text(saved),
+            "Recomputed B01": recalculated if recalculated is not None else "Not Available",
+            "Difference": difference,
+            "Status": status,
+        })
+
+    output = pd.DataFrame(rows, columns=columns)
+    output.attrs = comparison.attrs
+    return output
+
+
+def _upload_import_context(excel_file):
+    context = getattr(excel_file, "_assessment_import_context", None)
+    if context is None:
+        context = {"sources": {}, "warnings": [], "grids": {}, "formula_grids": {}}
+        excel_file._assessment_import_context = context
+    return context
+
+
+def _upload_sheet_grid(excel_file, sheet_name, formulas=False):
+    context = _upload_import_context(excel_file)
+    cache = context["formula_grids" if formulas else "grids"]
+    if sheet_name not in cache:
+        if formulas:
+            original = excel_file.io
+            if hasattr(original, "getvalue"):
+                source_bytes = original.getvalue()
+            else:
+                source_bytes = Path(original).read_bytes()
+            with pd.ExcelFile(
+                BytesIO(source_bytes), engine="openpyxl", engine_kwargs={"data_only": False}
+            ) as formula_file:
+                cache[sheet_name] = pd.read_excel(
+                    formula_file, sheet_name=sheet_name, header=None, dtype=object
+                )
+        else:
+            cache[sheet_name] = pd.read_excel(
+                excel_file, sheet_name=sheet_name, header=None, dtype=object
+            )
+    return cache[sheet_name]
+
+
+def _upload_ahp_weights(excel_file, system):
+    weights, source, warnings = _read_upload_ahp_weights(excel_file, system)
+    context = _upload_import_context(excel_file)
+    context["sources"]["AHP category weights"] = source
+    for warning in warnings:
+        if warning not in context["warnings"]:
+            context["warnings"].append(warning)
+    return weights
+
+
+def _read_active_pli_inputs(excel_file, elements):
+    """Select the referenced input table and recompute from its raw fields."""
+    import re
+    from openpyxl.utils.cell import column_index_from_string, get_column_letter
+
+    context = _upload_import_context(excel_file)
+    raw = _upload_sheet_grid(excel_file, "Physical_Loss")
+    formulas = _upload_sheet_grid(excel_file, "Physical_Loss", formulas=True)
+    if len(raw) < 3:
+        raise ValueError("Physical_Loss has no row-3 input headers.")
+    headers = [_excel_text(value) for value in raw.iloc[2]]
+    record_headers = {"Loss_Record_ID", "Damage_Record_ID", "Damage_ID", "Source_Damage_ID"}
+    output_headers = {
+        "Physical_Loss_Quantity", "Physical_Loss_Quantity (group units)",
+        "Record_Loss_Qty", "Record_Loss_Quantity", "Capped_Loss_Once",
+        "Element_Loss_Qty_Capped_Once", "Element_Loss_Capped_Once",
+    }
+    aliases = {
+        "element": ["Element_ID"],
+        "extent": ["Damage_Extent_%", "Extent_%"],
+        "severity": ["Severity_Factor", "Severity"],
+        "quantity": ["Verified_Total_Quantity", "Total_Quantity"],
+        "unit": ["Measurement_Basis", "Unit"],
+    }
+    starts = [index for index, name in enumerate(headers) if name in record_headers]
+    candidates = []
+    for number, start in enumerate(starts):
+        end = starts[number + 1] if number + 1 < len(starts) else len(headers)
+        mapping = {"record": start}
+        for field, names in aliases.items():
+            matches = [index for index in range(start, end) if headers[index] in names]
+            if len(matches) == 1:
+                mapping[field] = matches[0]
+        outputs = [index for index in range(start, end) if headers[index] in output_headers]
+        if all(field in mapping for field in aliases) and outputs:
+            candidates.append({"mapping": mapping, "outputs": outputs, "start": start, "end": end})
+    if not candidates:
+        raise ValueError("Physical_Loss has no supported complete raw-input table.")
+
+    inventory = elements.set_index("Element_ID", drop=False)
+    inventory_ids = set(inventory.index)
+    calculation_rows = {}
+    referenced_outputs = set()
+    loss_headings = {
+        "Element_Loss_Quantity", "Element_Capped_Loss_Qty", "Capped_Element_Loss",
+        "Capped_Loss", "Capped_Loss_Quantity", "Element_Loss_Qty",
+    }
+    external_reference = re.compile(
+        r"(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?",
+        re.IGNORECASE,
+    )
+
+    def cell(grid, row, column):
+        return grid.iat[row, column] if row < len(grid) and column < len(grid.columns) else None
+
+    if "Calculation_Details" in excel_file.sheet_names:
+        calculation = _upload_sheet_grid(excel_file, "Calculation_Details")
+        calculation_formulas = _upload_sheet_grid(excel_file, "Calculation_Details", formulas=True)
+        blocks = []
+        for row_number in range(len(calculation_formulas)):
+            row_headers = [_excel_text(value) for value in calculation_formulas.iloc[row_number]]
+            new_blocks = []
+            for quantity_col, heading in enumerate(row_headers):
+                if heading not in {"Total_Quantity", "Verified_Total_Quantity"}:
+                    continue
+                ids = [i for i in range(quantity_col) if row_headers[i] == "Element_ID"]
+                loss_cols = [i for i in range(quantity_col + 1, len(row_headers)) if row_headers[i] in loss_headings]
+                if ids and loss_cols:
+                    new_blocks.append((ids[-1], quantity_col, loss_cols[0]))
+            if new_blocks:
+                blocks = new_blocks
+                continue
+            for id_col, quantity_col, loss_col in blocks:
+                element_id = _excel_text(cell(calculation, row_number, id_col))
+                if element_id not in inventory_ids:
+                    continue
+                formula = _excel_text(cell(calculation_formulas, row_number, loss_col))
+                if not formula.startswith("=") or not re.search(r"SUMIFS?\s*\(", formula, re.IGNORECASE):
+                    continue
+                refs = [
+                    column_index_from_string(match.group(3)) - 1
+                    for match in external_reference.finditer(formula)
+                    if (match.group(1) or match.group(2)).lower() == "physical_loss"
+                ]
+                used = {column for column in refs if column < len(headers) and headers[column] in output_headers}
+                if not used:
+                    continue
+                if element_id in calculation_rows:
+                    raise ValueError(f"Calculation_Details has ambiguous PLI rows for {element_id}.")
+                calculation_rows[element_id] = (row_number, quantity_col, formula)
+                referenced_outputs.update(used)
+    selected = [table for table in candidates if referenced_outputs.intersection(table["outputs"])]
+    if not selected and len(candidates) == 1 and not referenced_outputs:
+        selected = candidates
+    if len(selected) != 1:
+        raise ValueError(
+            "Physical_Loss contains multiple or ambiguous input tables. "
+            "Calculation_Details must identify exactly one active PLI loss table."
+        )
+    table = selected[0]
+    mapping = table["mapping"]
+    source_label = (
+        "Physical_Loss!" + get_column_letter(table["start"] + 1) + ":"
+        + get_column_letter(max(table["outputs"]) + 1)
+    )
+    context["sources"]["PLI records"] = source_label + (
+        " (selected by Calculation_Details formula dependencies)" if referenced_outputs
+        else " (single supported input table)"
+    )
+    helper_table = headers[mapping["record"]] != "Loss_Record_ID"
+    damage_rows = {}
+    damage_grid = None
+    damage_id_col = None
+    if helper_table:
+        damage_grid = _upload_sheet_grid(excel_file, "Damage_Assessment")
+        damage_headers = [_excel_text(value) for value in damage_grid.iloc[2]]
+        damage_id_col = next((i for i, name in enumerate(damage_headers) if name in record_headers), 0)
+        for row_number in range(3, len(damage_grid)):
+            record_id = _excel_text(cell(damage_grid, row_number, damage_id_col))
+            if not record_id:
+                continue
+            if record_id in damage_rows:
+                raise ValueError(f"Damage_Assessment has duplicate damage record ID {record_id}.")
+            damage_rows[record_id] = {
+                name: cell(damage_grid, row_number, index)
+                for index, name in enumerate(damage_headers) if name
+            }
+
+    inventory_quantity_col = None
+    inventory_grid = _upload_sheet_grid(excel_file, "Element_Inventory")
+    inventory_headers = [_excel_text(value) for value in inventory_grid.iloc[2]]
+    inventory_id_col = inventory_headers.index("Element_ID")
+    if "Total_Quantity" in inventory_headers:
+        inventory_quantity_col = inventory_headers.index("Total_Quantity")
+    record_quantities = {}
+
+    def quantity_value(sheet_name, row, column, element_id, seen=None):
+        seen = set() if seen is None else set(seen)
+        address = (sheet_name, row, column)
+        if address in seen:
+            raise ValueError("Circular PLI quantity dependency at " + str(address))
+        seen.add(address)
+        formula_grid = _upload_sheet_grid(excel_file, sheet_name, formulas=True)
+        value = cell(formula_grid, row, column)
+        label = f"{sheet_name}!{get_column_letter(column + 1)}{row + 1}"
+        if sheet_name == "Element_Inventory" and column == inventory_quantity_col:
+            referenced_id = _excel_text(cell(inventory_grid, row, inventory_id_col))
+            if referenced_id != element_id:
+                raise ValueError(f"{label} refers to a different Element_ID ({referenced_id}), not {element_id}.")
+        if isinstance(value, (int, float, np.number)) and not isinstance(value, (bool, np.bool_)):
+            numeric = float(value)
+        elif isinstance(value, str) and value.startswith("="):
+            direct = re.fullmatch(
+                r"=\s*(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?\$?([A-Z]+)\$?(\d+)\s*",
+                value, flags=re.IGNORECASE,
+            )
+            if direct:
+                return quantity_value(
+                    direct.group(1) or direct.group(2) or sheet_name,
+                    int(direct.group(4)) - 1,
+                    column_index_from_string(direct.group(3)) - 1,
+                    element_id, seen,
+                )
+            expression = re.sub(r'"(?:[^"]|"")*"', '""', value)
+            function_names = set(re.findall(r"\b([A-Z_][A-Z0-9_.]*)\s*\(", expression, re.IGNORECASE))
+            allowed_functions = {"IF", "IFERROR", "INDEX", "MATCH", "COUNTIF", "COUNTIFS", "ISNUMBER", "AND", "OR", "NOT"}
+            if (re.search(r"[+*/^&-]", expression)
+                    or not function_names
+                    or {name.upper() for name in function_names} - allowed_functions):
+                raise ValueError(f"Unsupported arithmetic or quantity formula at {label}; only explicit references and guarded passthroughs are supported.")
+            references = list(external_reference.finditer(value))
+            inventory_refs = [match for match in references if (match.group(1) or match.group(2)).lower() == "element_inventory"]
+            if inventory_refs and any(
+                (match.group(1) or match.group(2)).lower() != "element_inventory"
+                for match in references
+            ):
+                raise ValueError(f"Mixed active quantity sources at {label} are not supported.")
+            for reference in inventory_refs:
+                if reference.group(5) is None:
+                    referenced_id = _excel_text(cell(inventory_grid, int(reference.group(4)) - 1, inventory_id_col))
+                    if referenced_id != element_id:
+                        raise ValueError(f"{label} refers to another inventory element ({referenced_id}), not {element_id}.")
+            if inventory_quantity_col is not None and any(
+                column_index_from_string(match.group(3)) - 1 == inventory_quantity_col
+                for match in inventory_refs
+            ):
+                # Respect explicit source evidence guards without promoting a header to evidence.
+                allowed_statuses = [status for status in ("Verified", "User Provided") if f'"{status}"' in value]
+                if allowed_statuses:
+                    referenced_columns = {column_index_from_string(match.group(3)) - 1 for match in inventory_refs}
+                    status_columns = [
+                        inventory_headers[index] for index in referenced_columns
+                        if index < len(inventory_headers) and "support_status" in inventory_headers[index].lower()
+                    ]
+                    for status_column in status_columns:
+                        if _excel_text(inventory.loc[element_id].get(status_column)) not in allowed_statuses:
+                            raise ValueError(f"{label} does not permit the source quantity status for {element_id}.")
+                numeric = pd.to_numeric(inventory.loc[element_id].get("Total_Quantity"), errors="coerce")
+            else:
+                helper_refs = [match for match in references if (match.group(1) or match.group(2)).lower() == "physical_loss"
+                               and column_index_from_string(match.group(3)) - 1 == mapping["quantity"]]
+                if helper_refs and element_id in record_quantities:
+                    numeric = record_quantities[element_id]
+                else:
+                    raise ValueError(f"Unsupported or ambiguous active PLI quantity dependency at {label}.")
+        else:
+            raise ValueError(f"{label} has no numeric active PLI quantity for {element_id}.")
+        if pd.isna(numeric) or not np.isfinite(numeric) or numeric <= 0:
+            raise ValueError(f"{label} must provide a finite positive quantity for {element_id}.")
+        return float(numeric)
+
+    records = []
+    seen_records = set()
+    resolved_record_ids = {}
+    for row_number in range(3, max(len(raw), len(formulas))):
+        record_id = _excel_text(cell(raw, row_number, mapping["record"]))
+        id_formula = _excel_text(cell(formulas, row_number, mapping["record"]))
+        if helper_table and "Damage_Assessment!" in id_formula:
+            linked_rows = {int(match.group(4)) - 1 for match in external_reference.finditer(id_formula)
+                           if (match.group(1) or match.group(2)).lower() == "damage_assessment" and not match.group(5)}
+            if len(linked_rows) == 1:
+                record_id = _excel_text(cell(damage_grid, linked_rows.pop(), damage_id_col))
+        resolved_record_ids[row_number] = record_id
+    last_record_row = max((row for row, record_id in resolved_record_ids.items() if record_id), default=-1)
+    for row_number, record_id in resolved_record_ids.items():
+        values = {field: cell(raw, row_number, column) for field, column in mapping.items()}
+        if not record_id and not _excel_text(values["element"]) and not _excel_text(values["severity"]):
+            if row_number <= last_record_row and _excel_text(values["extent"]):
+                raise ValueError(
+                    f"{source_label} has an incomplete extent-only record at row {row_number + 1}; "
+                    "record ID, element ID, and severity are required within the input records."
+                )
+            # A lone extent below the last input record can be an audit footer.
+            continue
+        if not record_id or record_id == "Not Available" or record_id in seen_records:
+            raise ValueError(f"{source_label} contains a missing or duplicate record ID at row {row_number + 1}.")
+        seen_records.add(record_id)
+        if helper_table:
+            if record_id not in damage_rows:
+                raise ValueError(f"{source_label} references unknown damage record {record_id}.")
+            source = damage_rows[record_id]
+            for field, names in {
+                "element": ["Element_ID"], "extent": ["Damage_Extent_%", "Extent_%"],
+                "severity": ["Severity_Factor", "Severity"],
+            }.items():
+                field_formula = _excel_text(cell(formulas, row_number, mapping[field]))
+                if "Damage_Assessment!" in field_formula:
+                    source_name = next((name for name in names if name in source), None)
+                    if source_name is None:
+                        raise ValueError(f"Damage_Assessment lacks the raw {field} field for {record_id}.")
+                    values[field] = source[source_name]
+        element_id = _excel_text(values["element"])
+        if element_id not in inventory_ids:
+            raise ValueError(f"{source_label} references unknown Element_ID {element_id}.")
+        quantity = quantity_value("Physical_Loss", row_number, mapping["quantity"], element_id)
+        if element_id in record_quantities and not np.isclose(record_quantities[element_id], quantity, rtol=0.0, atol=1e-9):
+            raise ValueError(f"{source_label} has inconsistent record quantities for {element_id}.")
+        record_quantities[element_id] = quantity
+        unit = _excel_text(values["unit"])
+        inventory_unit = _excel_text(inventory.loc[element_id].get("Measurement_Basis"))
+        if unit and inventory_unit and unit != inventory_unit:
+            raise ValueError(f"{source_label} and Element_Inventory use different units for {element_id}.")
+        records.append({
+            "Loss_Record_ID": record_id, "Element_ID": element_id,
+            "Damage_Extent_%": values["extent"], "Severity_Factor": values["severity"],
+            "Record_Total_Quantity": quantity, "Measurement_Basis": unit or inventory_unit,
+            "Source_Row": row_number + 1, "Input_Table": source_label,
+        })
+
+    adjusted = elements.copy()
+    if "Total_Quantity" not in adjusted:
+        adjusted["Total_Quantity"] = np.nan
+    adjusted["Inventory_Total_Quantity"] = adjusted["Total_Quantity"]
+    active_quantities = []
+    quantity_sources = []
+    for _, element in adjusted.iterrows():
+        element_id = element["Element_ID"]
+        if calculation_rows:
+            if element_id not in calculation_rows:
+                raise ValueError(f"Calculation_Details has no unambiguous active PLI quantity for {element_id}.")
+            row_number, quantity_col, _ = calculation_rows[element_id]
+            quantity = quantity_value("Calculation_Details", row_number, quantity_col, element_id)
+            quantity_source = f"Calculation_Details!{get_column_letter(quantity_col + 1)}{row_number + 1}"
+        else:
+            quantity = pd.to_numeric(element.get("Total_Quantity"), errors="coerce")
+            if pd.isna(quantity) or not np.isfinite(quantity) or quantity <= 0:
+                raise ValueError(f"Element_Inventory has no positive PLI quantity for {element_id}.")
+            quantity_source = "Element_Inventory.Total_Quantity"
+        original_quantity = pd.to_numeric(element.get("Inventory_Total_Quantity"), errors="coerce")
+        if pd.isna(original_quantity) or not np.isclose(quantity, original_quantity, rtol=0.0, atol=1e-9):
+            context["warnings"].append(
+                f"{element_id}: active PLI quantity {quantity:.12g} from {quantity_source} "
+                f"differs from inventory quantity {_excel_text(element.get('Inventory_Total_Quantity'))}. "
+                "The active quantity is used for the element cap and category denominator; "
+                "the original inventory quantity is retained separately for review."
+            )
+        active_quantities.append(float(quantity))
+        quantity_sources.append(quantity_source)
+    adjusted["Total_Quantity"] = active_quantities
+    active_quantity_map = adjusted.set_index("Element_ID")["Total_Quantity"].to_dict()
+    inconsistent = [element_id for element_id, quantity in record_quantities.items()
+                    if not np.isclose(quantity, active_quantity_map[element_id], rtol=0.0, atol=1e-9)]
+    if inconsistent:
+        raise ValueError(
+            "Active PLI record and denominator quantities disagree for: " + ", ".join(inconsistent)
+            + ". Review the explicit quantity sources before aggregation."
+        )
+    adjusted["PLI_Quantity_Source"] = quantity_sources
+    context["sources"]["PLI quantities"] = "Active Calculation_Details quantity dependencies" if calculation_rows else "Element_Inventory.Total_Quantity"
+    for column in adjusted.columns:
+        if "support_status" in str(column).lower():
+            unsupported = adjusted.loc[adjusted[column].apply(_excel_text).str.lower() == "unsupported", "Element_ID"].tolist()
+            if unsupported:
+                context["warnings"].append(
+                    f"Source {column} is Unsupported for: " + ", ".join(unsupported)
+                    + ". Reproducing the active workbook calculation does not verify these quantities."
+                )
+    if "Measurement_Basis" in adjusted:
+        for category, group in adjusted.groupby("Element_Type"):
+            units = set(group["Measurement_Basis"].apply(_excel_text)) - {""}
+            if len(units) > 1:
+                raise ValueError(f"PLI category {category} mixes incompatible measurement units.")
+    columns = ["Loss_Record_ID", "Element_ID", "Damage_Extent_%", "Severity_Factor", "Record_Total_Quantity", "Measurement_Basis", "Source_Row", "Input_Table"]
+    return pd.DataFrame(records, columns=columns), adjusted
+
+
+def _finish_upload_review(excel_file, result):
+    context = _upload_import_context(excel_file)
+    if result["template_type"] == "Complete Building Assessment":
+        comparison = _compare_saved_excel(excel_file, result["building_info"], result)
+        result["Saved_Excel_Comparison"] = comparison
+        context["warnings"].extend(comparison.attrs.get("warnings", []))
+        context["sources"]["Saved PLI comparison"] = comparison.attrs.get("saved_sources", {}).get("PLI", "Unavailable")
+    result["Import_Provenance"] = context["sources"].copy()
+    result["Import_Warnings"] = list(dict.fromkeys(context["warnings"]))
+    return result
+
+
 def _prepare_element_inventory(excel_file, system, sheet_name="Element_Inventory", require_quantity=False):
     elements = _read_table(excel_file, sheet_name).copy()
 
@@ -1067,7 +1605,7 @@ def _prepare_element_inventory(excel_file, system, sheet_name="Element_Inventory
             + ", ".join(sorted(set(duplicated_ids)))
         )
 
-    approved_weights = AHP_ELEMENT_WEIGHTS[system]["weights"]
+    approved_weights = _upload_ahp_weights(excel_file, system)
     unknown_types = sorted(
         set(elements.loc[
             ~elements["Element_Type"].isin(approved_weights.keys()),
@@ -1138,6 +1676,30 @@ def _prepare_element_inventory(excel_file, system, sheet_name="Element_Inventory
     return elements
 
 
+def _di_review_messages(elements, di_value):
+    """Report B01 sum diagnostics without changing the calculated values."""
+    messages = []
+    over_limit = elements.loc[elements["Element_DI"] > 100.0]
+    if len(over_limit) > 0:
+        element_values = ", ".join(
+            f"{row['Element_ID']}={float(row['Element_DI']):.6g}"
+            for _, row in over_limit.iterrows()
+        )
+        messages.append(
+            "CHECK ELEMENT DI >100: " + element_values
+            + ". The uncapped B01 sums are retained. Review overlapping "
+            "or duplicated damage records."
+        )
+    numeric_di = float(di_value)
+    if not 0.0 <= numeric_di <= 100.0:
+        messages.append(
+            f"Building DI ({numeric_di:.6g}) is outside the accepted 0-100 range. "
+            "The raw result is retained for review; it cannot be used to calculate FAI "
+            "or as an AI input until the source assessment is resolved. No cap is applied."
+        )
+    return messages
+
+
 def _extract_di_from_excel(excel_file, info):
     system = _normalize_structural_system(info.get("Structural_System"))
     elements = _prepare_element_inventory(excel_file, system)
@@ -1198,20 +1760,16 @@ def _extract_di_from_excel(excel_file, info):
             damages["Damage_Extent_%"]
             * damages["Severity_Factor"]
         )
-        element_di_map = damages.groupby("Element_ID")["Damage_Contribution"].max().to_dict()
+        # B01 protocol: retain the uncapped sum of all damage records per element.
+        element_di_map = damages.groupby("Element_ID")["Damage_Contribution"].sum().to_dict()
     else:
         damages["Damage_Contribution"] = pd.Series(dtype=float)
         element_di_map = {}
 
     elements["Element_DI"] = elements["Element_ID"].map(element_di_map).fillna(0.0)
 
-    over_limit = elements[elements["Element_DI"] > 100.0 + 1e-9]
-    if len(over_limit) > 0:
-        raise ValueError(
-            "Element_DI exceeds 100 for: "
-            + ", ".join(over_limit["Element_ID"].tolist())
-            + ". Review overlapping or duplicated damage records."
-        )
+    # Element sums above 100 are B01 review flags, not capped or discarded.
+    # The building DI is checked against 0-100 before any FAI calculation.
 
     denominator = float(elements["Applied_Element_Weight"].sum())
     if denominator <= 0:
@@ -1251,9 +1809,9 @@ def _extract_pli_from_excel(excel_file, info):
     elements = _prepare_element_inventory(
         excel_file,
         system,
-        require_quantity=True,
+        require_quantity=False,
     )
-    losses = _read_table(excel_file, "Physical_Loss").copy()
+    losses, elements = _read_active_pli_inputs(excel_file, elements)
 
     required = ["Element_ID", "Damage_Extent_%", "Severity_Factor"]
     missing = [column for column in required if column not in losses.columns]
@@ -1332,7 +1890,7 @@ def _extract_pli_from_excel(excel_file, info):
         if not losses["Severity_Factor"].isin([0.25, 0.50, 0.75, 0.90, 1.00]).all():
             raise ValueError("PLI Severity_Factor must be one of 0.25, 0.50, 0.75, 0.90, 1.00.")
 
-        losses["Total_Quantity_Recomputed"] = losses["Element_ID"].map(quantity_map).astype(float)
+        losses["Total_Quantity_Recomputed"] = losses["Record_Total_Quantity"].astype(float)
         losses["Physical_Loss_Quantity_Recomputed"] = (
             losses["Total_Quantity_Recomputed"]
             * (losses["Damage_Extent_%"] / 100.0)
@@ -1413,7 +1971,7 @@ def _extract_tri_from_excel(excel_file, info):
     )
 
     element_type_map = elements.set_index("Element_ID")["Element_Type"].to_dict()
-    approved_element_weights = AHP_ELEMENT_WEIGHTS[system]["weights"]
+    approved_element_weights = _upload_ahp_weights(excel_file, system)
 
     unknown_ids = sorted(set(tests["Element_ID"]) - set(elements["Element_ID"]))
     if unknown_ids:
@@ -1787,7 +2345,7 @@ def process_uploaded_assessment_workbook(file_bytes):
             si_value,
         )
 
-        return {
+        return _finish_upload_review(excel_file, {
             "template_type": "Complete Building Assessment",
             "building_info": info,
             "DI": di_value,
@@ -1815,33 +2373,33 @@ def process_uploaded_assessment_workbook(file_bytes):
             "si_weight_sum": si_weight_sum,
             "si_details": si_details,
             "fai_details": fai_details,
-        }
+        })
 
     if "DI_Summary" in sheets and "Damage_Assessment" in sheets:
         di_value, system, elements, damages = _extract_di_from_excel(excel_file, info)
-        return {
+        return _finish_upload_review(excel_file, {
             "template_type": "DI",
             "building_info": info,
             "DI": di_value,
             "di_system": system,
             "di_elements": elements,
             "di_damage": damages,
-        }
+        })
 
     if "PLI_Summary" in sheets and "Physical_Loss" in sheets:
         pli_value, system, elements, losses = _extract_pli_from_excel(excel_file, info)
-        return {
+        return _finish_upload_review(excel_file, {
             "template_type": "PLI",
             "building_info": info,
             "PLI": pli_value,
             "pli_system": system,
             "pli_elements": elements,
             "pli_losses": losses,
-        }
+        })
 
     if "TRI_Summary" in sheets and "Test_Results" in sheets:
         tri_value, tri_flag, tri_status, system, test_rows, element_rows = _extract_tri_from_excel(excel_file, info)
-        return {
+        return _finish_upload_review(excel_file, {
             "template_type": "TRI",
             "building_info": info,
             "TRI": tri_value,
@@ -1850,18 +2408,18 @@ def process_uploaded_assessment_workbook(file_bytes):
             "tri_system": system,
             "tri_tests": test_rows,
             "tri_elements": element_rows,
-        }
+        })
 
     if "SI_Summary" in sheets and "Sustainability_Assessment" in sheets:
         si_value, heritage, weight_sum, details = _extract_si_from_excel(excel_file, info)
-        return {
+        return _finish_upload_review(excel_file, {
             "template_type": "SI",
             "building_info": info,
             "SI": si_value,
             "si_heritage": heritage,
             "si_weight_sum": weight_sum,
             "si_details": details,
-        }
+        })
 
     raise ValueError(
         "The uploaded workbook is not one of the supported assessment templates."
@@ -1947,9 +2505,6 @@ def load_uploaded_result_into_session(result):
             summary_data.items(),
             columns=["Assessment Item", "Value"],
         )
-        # Snapshot the breakdown with the completed report, separately from
-        # later index calculations in the same session.
-        st.session_state.latest_fai_calculation_results = result["fai_details"].copy()
         st.session_state.latest_calculated_fai = float(result["FAI"])
         st.session_state.latest_calculated_fai_class = result["FAI_Condition_Class"]
         st.session_state.latest_predicted_fai = None
@@ -1962,12 +2517,6 @@ def load_uploaded_result_into_session(result):
         st.session_state.latest_confirmed_critical_failures = list(
             result.get("Confirmed_Critical_Failures", [])
         )
-        # A new completed assessment must never inherit another report's comment.
-        st.session_state.latest_cf_assessor_comment = ""
-        st.session_state.pop("report_cf_assessor_comment", None)
-        st.session_state.latest_engineering_recommendations = ""
-        st.session_state.pop("report_engineering_recommendations", None)
-        _reset_assessment_report_details()
 
         # Sync the separate AI assessment screen to this exact uploaded workbook.
         # This does not change the deterministic index equations or AHP weights.
@@ -2004,87 +2553,6 @@ def load_uploaded_result_into_session(result):
 # ============================================================
 # PDF ASSESSMENT REPORT
 # ============================================================
-
-REPORT_DETAIL_WIDGET_FIELDS = {
-    "beneficiary_entity": "report_beneficiary_entity",
-    "assessing_entity": "report_assessing_entity",
-    "report_number": "report_number",
-    "inspection_name": "report_inspection_name",
-    "assessment_date": "report_assessment_date",
-    "assessor_name": "report_assessor_name",
-}
-
-
-def _reset_assessment_report_details():
-    """Start each completed building assessment with its own empty report details."""
-    st.session_state.latest_report_details = {}
-    for widget_key in REPORT_DETAIL_WIDGET_FIELDS.values():
-        st.session_state.pop(widget_key, None)
-
-
-CRITICAL_FAILURE_DEFINITIONS = {
-    "CF1": "Actual Partial or Total Collapse",
-    "CF2": "Structural Instability or Loss of Support",
-    "CF3": "Falling or Imminent Local Collapse Hazard",
-}
-
-
-def _critical_failure_report_rows(confirmed_critical_failures=None):
-    """Describe the recorded flags without inferring a cause from index scores."""
-    confirmed = set(confirmed_critical_failures or [])
-    return [
-        {
-            "Code": code,
-            "Critical Failure Indicator": title,
-            "Status": "Activated" if code in confirmed else "Not Activated",
-        }
-        for code, title in CRITICAL_FAILURE_DEFINITIONS.items()
-    ]
-
-
-def _report_safety_override_active(critical_failure_index, safety_status):
-    """Read saved safety fields for display styling; never alter the decision."""
-    try:
-        flag_is_active = float(critical_failure_index) == 1.0
-    except (TypeError, ValueError):
-        flag_is_active = False
-    return flag_is_active or str(safety_status).strip().lower() == "activated"
-
-
-def _recorded_safety_table_html(frame, override_active=False):
-    """Highlight only recorded status/result cells, keeping row labels neutral."""
-    safety_items = {"CRITICAL FAILURE INDEX", "SAFETY OVERRIDE STATUS", "FINAL DECISION"}
-    parts = [
-        '<div style="overflow-x:auto;margin-bottom:1rem;">',
-        '<table style="width:100%;border-collapse:collapse;font-size:0.95rem;">',
-        '<thead><tr style="background-color:#0F4C5C;color:#FFFFFF;">',
-    ]
-    for column in frame.columns:
-        parts.append(
-            '<th style="padding:0.6rem;border:1px solid #91B9B0;text-align:left;color:#FFFFFF;">'
-            + html.escape(str(column)) + '</th>'
-        )
-    parts.append('</tr></thead><tbody>')
-    for position, (_, row) in enumerate(frame.iterrows()):
-        row_background = "#FFFFFF" if position % 2 == 0 else "#F5F9F8"
-        parts.append(f'<tr style="background-color:{row_background};color:#153B43;">')
-        for column, value in row.items():
-            is_active_cell = (column == "Status" and value == "Activated") or (
-                column == "Result" and override_active
-                and row.get("Final Assessment Item") in safety_items
-            )
-            background = "#C00000" if is_active_cell else row_background
-            foreground = "#FFFFFF" if is_active_cell else "#153B43"
-            weight = "bold" if is_active_cell else "normal"
-            parts.append(
-                f'<td style="padding:0.6rem;border:1px solid #B9C8C5;vertical-align:top;'
-                f'background-color:{background};color:{foreground};font-weight:{weight};">'
-                + html.escape(_excel_text(value)) + '</td>'
-            )
-        parts.append('</tr>')
-    parts.append('</tbody></table></div>')
-    return ''.join(parts)
-
 
 def _assessment_summary_to_dict(summary_df):
     """Convert the two-column Results & Reports dataframe into a plain dict."""
@@ -2179,189 +2647,12 @@ def calculate_final_assessment_building_index(calculated_fai, ai_predicted_fai):
     return None, "Not Available"
 
 
-def _pdf_matching_fai_details(summary, fai_details, fai_scenario=None):
-    """Validate a saved FAI breakdown against this report without changing it."""
-    required_columns = {
-        "Index", "Index_Value", "Converted_Score",
-        "Applied_Weight", "FAI_Contribution",
-    }
-    if not isinstance(fai_details, pd.DataFrame):
-        return None
-    if not required_columns.issubset(fai_details.columns):
-        return None
-
-    reported_fai = _optional_fai_value(
-        summary.get("Calculated FAI", summary.get("FAI"))
-    )
-    if reported_fai is None or not np.isfinite(reported_fai):
-        return None
-
-    tri_value = _optional_fai_value(summary.get("TRI"))
-    tri_is_available = tri_value is not None and np.isfinite(tri_value)
-    weights = (
-        FULL_FAI_UPLOAD_WEIGHTS if tri_is_available
-        else NO_TRI_FAI_UPLOAD_WEIGHTS
-    )
-    expected_indices = {name for name, weight in weights.items() if weight > 0}
-    expected_scenario = (
-        "Full 4-Index Assessment" if tri_is_available
-        else "TRI Not Available – 3-Index Assessment"
-    )
-    saved_scenario = fai_scenario or summary.get("FAI Scenario")
-    if saved_scenario and str(saved_scenario) != expected_scenario:
-        return None
-
-    details = fai_details.copy(deep=True)
-    if (len(details) != len(expected_indices)
-            or details["Index"].duplicated().any()
-            or set(details["Index"]) != expected_indices):
-        return None
-
-    rows = []
-    total = 0.0
-    for name in ("DI", "PLI", "TRI", "SI"):
-        if name not in expected_indices:
-            continue
-        record = details.loc[details["Index"] == name].iloc[0]
-        try:
-            raw = float(record["Index_Value"])
-            score = float(record["Converted_Score"])
-            weight = float(record["Applied_Weight"])
-            contribution = float(record["FAI_Contribution"])
-        except (TypeError, ValueError):
-            return None
-        if not all(np.isfinite(v) for v in (raw, score, weight, contribution)):
-            return None
-        if not (0 <= raw <= 100 and 0 <= score <= 100 and 0 < weight <= 1):
-            return None
-        shown_raw = _optional_fai_value(summary.get(name))
-        if (shown_raw is None or not np.isfinite(shown_raw)
-                or round(raw, 2) != round(shown_raw, 2)):
-            return None
-        expected_score = 100.0 - raw if name in {"DI", "PLI"} else raw
-        if (abs(score - expected_score) > 1e-8
-                or abs(weight - float(weights[name])) > 1e-10
-                or abs(contribution - score * weight) > 1e-8):
-            return None
-        rows.append({
-            "Index": name,
-            "Converted_Score": score,
-            "Applied_Weight": weight,
-            "Weighted_Shortfall": weight * (100.0 - score),
-        })
-        total += contribution
-
-    total = max(0.0, min(100.0, total))
-    if round(total, 2) != round(reported_fai, 2):
-        return None
-    return {"FAI": total, "Rows": rows}
-
-
-def _pdf_assessment_interpretation(summary, calculated_fai, matching_details):
-    """Explain the existing weighted result; do not diagnose physical causes."""
-    paragraphs = []
-    if calculated_fai is not None and np.isfinite(calculated_fai):
-        condition = get_fai_class(calculated_fai)
-        bounds = {
-            "Good": "70 ≤ FAI ≤ 100",
-            "Moderate": "55 ≤ FAI < 70",
-            "Poor": "40 ≤ FAI < 55",
-            "Critical": "0 ≤ FAI < 40",
-        }
-        paragraphs.append(
-            f"The calculated FAI is {calculated_fai:.2f}, corresponding to the "
-            f"{condition} category ({bounds[condition]})."
-        )
-        if get_fai_class(round(calculated_fai, 2)) != condition:
-            unrounded_text = f"{calculated_fai:.12g}"
-            if get_fai_class(float(unrounded_text)) != condition:
-                unrounded_text = repr(calculated_fai)
-            paragraphs[-1] += (
-                " The class is determined before display rounding "
-                f"(unrounded FAI = {unrounded_text})."
-            )
-    else:
-        paragraphs.append(
-            "The calculated FAI is not available; a numerical MCDA condition "
-            "class cannot be interpreted."
-        )
-
-    if matching_details is not None:
-        rows = matching_details["Rows"]
-        scores = {row["Index"]: row["Converted_Score"] for row in rows}
-        benefit_text = f"SI = {scores['SI']:.2f} is a benefit score."
-        if "TRI" in scores:
-            benefit_text = (
-                f"TRI = {scores['TRI']:.2f} and SI = {scores['SI']:.2f} "
-                "are benefit scores."
-            )
-        paragraphs.append(
-            "DI and PLI are adverse indices: their benefit-oriented scores are "
-            f"100 - DI = {scores['DI']:.2f} and 100 - PLI = {scores['PLI']:.2f}. "
-            + benefit_text + " Higher benefit scores increase FAI."
-        )
-        largest_shortfall = max(row["Weighted_Shortfall"] for row in rows)
-        if largest_shortfall <= 1e-10:
-            paragraphs.append(
-                "All included indicators attain the maximum benefit score; "
-                "there is no weighted shortfall from 100."
-            )
-        else:
-            leaders = [
-                row for row in rows
-                if abs(row["Weighted_Shortfall"] - largest_shortfall) <= 1e-10
-            ]
-            if len(leaders) == 1:
-                leader = leaders[0]
-                paragraphs.append(
-                    f"{leader['Index']} has the largest weighted shortfall "
-                    f"from 100: {largest_shortfall:.2f} FAI points "
-                    f"(applied weight {leader['Applied_Weight']:.2%}). "
-                    "Shortfall = weight x (100 - benefit score)."
-                )
-            else:
-                names = ", ".join(row["Index"] for row in leaders[:-1])
-                names += " and " + leaders[-1]["Index"]
-                paragraphs.append(
-                    f"{names} share the largest weighted shortfall from 100 "
-                    f"({largest_shortfall:.2f} FAI points each). "
-                    "Shortfall = weight x (100 - benefit score)."
-                )
-    elif calculated_fai is not None and np.isfinite(calculated_fai):
-        paragraphs.append(
-            "A matching weighted contribution breakdown is unavailable; "
-            "the main indicator influence cannot be identified."
-        )
-
-    safety_status = str(summary.get("Safety Override Status", "")).strip().lower()
-    if safety_status == "activated":
-        paragraphs.append(
-            "The Safety Override is activated. The recorded safety decision "
-            "applies independently of the numerical FAI and does not change its value."
-        )
-    elif safety_status == "not activated":
-        paragraphs.append(
-            "The Safety Override is not activated. This status is reported "
-            "independently of the numerical FAI and does not change its value."
-        )
-    else:
-        paragraphs.append(
-            "The safety decision is reported independently of the numerical FAI "
-            "and does not change its value."
-        )
-    return paragraphs
-
-
 def build_assessment_pdf(
     summary_df,
     result_source=None,
     fai_scenario=None,
     confirmed_critical_failures=None,
     assessor_name=None,
-    fai_details=None,
-    cf_assessor_comment=None,
-    engineering_recommendations=None,
-    report_details=None,
 ):
     """
     Build a concise A4 PDF report from the latest completed assessment.
@@ -2383,7 +2674,7 @@ def build_assessment_pdf(
         rightMargin=16 * mm,
         leftMargin=16 * mm,
         topMargin=14 * mm,
-        bottomMargin=18 * mm,
+        bottomMargin=17 * mm,
         title="Building Assessment Summary Report",
         author="Smart Assessment Model - University of Basra",
         subject="Existing Building Assessment Summary",
@@ -2417,8 +2708,8 @@ def build_assessment_pdf(
         fontSize=11,
         leading=14,
         textColor=colors.HexColor("#0F4C5C"),
-        spaceBefore=5,
-        spaceAfter=4,
+        spaceBefore=7,
+        spaceAfter=5,
     )
     body_style = ParagraphStyle(
         "AssessmentBody",
@@ -2459,47 +2750,30 @@ def build_assessment_pdf(
     story.append(Paragraph("SMART ASSESSMENT MODEL FOR EXISTING BUILDINGS", title_style))
     story.append(Paragraph("IN URBAN AREAS OF BASRA GOVERNORATE", subtitle_style))
     story.append(Paragraph("BUILDING ASSESSMENT SUMMARY REPORT", subtitle_style))
-    story.append(Spacer(1, 2 * mm))
+    story.append(Spacer(1, 3 * mm))
     story.append(HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#91B9B0")))
-    story.append(Spacer(1, 2 * mm))
+    story.append(Spacer(1, 3 * mm))
 
-    # Report details are supplied by the assessor, including the actual
-    # assessment date. Never substitute the PDF generation date for that date.
-    report_details = dict(report_details) if isinstance(report_details, dict) else {}
-
-    def detail_value(field):
-        value = report_details.get(field)
-        if field == "assessment_date" and hasattr(value, "strftime"):
-            value = value.strftime("%d/%m/%Y")
-        text = _excel_text(value)
-        return _pdf_safe_text(text) if text else "________________________"
-
-    metadata_rows = [
-        ["Beneficiary Entity", detail_value("beneficiary_entity"),
-         "Assessing Entity", detail_value("assessing_entity")],
-        ["Report No.", detail_value("report_number"),
-         "Inspection Name", detail_value("inspection_name")],
-        ["Assessment Date", detail_value("assessment_date"),
-         "Result Source", _pdf_safe_text(result_source or summary.get("Result Source"))],
-    ]
-    metadata_table = Table(
-        [[Paragraph(f"<b>{row[0]}</b>", body_style), Paragraph(row[1], body_style),
-          Paragraph(f"<b>{row[2]}</b>", body_style), Paragraph(row[3], body_style)]
-         for row in metadata_rows],
-        colWidths=[34 * mm, 54 * mm, 34 * mm, 54 * mm],
-        style=TableStyle([
-            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E8F3F0")),
-            ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#E8F3F0")),
-            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
-            ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]),
+    report_date = datetime.now().strftime("%d %B %Y")
+    story.append(
+        Table(
+            [
+                [Paragraph("<b>Report Date</b>", body_style), Paragraph(_pdf_safe_text(report_date), body_style)],
+                [Paragraph("<b>Result Source</b>", body_style), Paragraph(_pdf_safe_text(result_source or summary.get("Result Source")), body_style)],
+            ],
+            colWidths=[44 * mm, 132 * mm],
+            style=TableStyle([
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E8F3F0")),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]),
+        )
     )
-    story.append(KeepTogether([metadata_table]))
 
     story.append(Paragraph("Building Information", section_style))
     building_rows = [
@@ -2530,8 +2804,8 @@ def build_assessment_pdf(
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]),
         )
     )
@@ -2544,32 +2818,15 @@ def build_assessment_pdf(
         ["Physical Loss Level (PLI)", _pdf_number(summary.get("PLI"))],
         ["Test Result Level (TRI)", _pdf_number(summary.get("TRI"))],
         ["Sustainability Level (SI)", _pdf_number(summary.get("SI"))],
+        ["Calculated FAI (MCDA)", _pdf_number(calculated_fai_value)],
+        ["AI-Predicted FAI (Random Forest)", _pdf_number(predicted_fai_value)],
     ]
-    # Step 4: explain the saved no-test scenario directly below the TRI label.
-    # This is a reporting note only; it does not modify any index or FAI weight.
-    recorded_fai_for_note = _optional_fai_value(calculated_fai_value)
-    tri_without_tests = (
-        _optional_fai_value(summary.get("TRI")) is None
-        and (fai_scenario or summary.get("FAI Scenario"))
-        == "TRI Not Available – 3-Index Assessment"
-        and recorded_fai_for_note is not None
-        and np.isfinite(recorded_fai_for_note)
-    )
     index_table_data = [
         [Paragraph("<b>Level</b>", body_style), Paragraph("<b>Value</b>", body_style)]
+    ] + [
+        [Paragraph(_pdf_safe_text(label), body_style), Paragraph(_pdf_safe_text(value), body_style)]
+        for label, value in index_rows
     ]
-    for label, value in index_rows:
-        label_text = _pdf_safe_text(label)
-        if label == "Test Result Level (TRI)" and tri_without_tests:
-            label_text += (
-                '<br/><font size="7.5" color="#555555">'
-                'FAI was calculated using the approved three-index scenario '
-                'without test results.</font>'
-            )
-        index_table_data.append([
-            Paragraph(label_text, body_style),
-            Paragraph(_pdf_safe_text(value), body_style),
-        ])
     story.append(
         Table(
             index_table_data,
@@ -2584,18 +2841,13 @@ def build_assessment_pdf(
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]),
         )
     )
 
-    # Use the matching saved breakdown to classify the unrounded MCDA FAI.
-    # Only the displayed numerical value is rounded.
-    matching_fai_details = _pdf_matching_fai_details(summary, fai_details, fai_scenario)
     calculated_fai_numeric = _optional_fai_value(calculated_fai_value)
-    if matching_fai_details is not None:
-        calculated_fai_numeric = matching_fai_details["FAI"]
     predicted_fai_numeric = _optional_fai_value(predicted_fai_value)
     calculated_condition = (
         get_fai_class(calculated_fai_numeric)
@@ -2607,113 +2859,52 @@ def build_assessment_pdf(
         if predicted_fai_numeric is not None
         else "Not Available"
     )
-    # The AI condition stored with the prediction was determined before
-    # rounding its displayed value; retain that recorded class when available.
-    saved_predicted_condition = str(summary.get("AI-Predicted FAI Condition", "")).strip()
-    if predicted_fai_numeric is not None and saved_predicted_condition in {
-        "Good", "Moderate", "Poor", "Critical"
-    }:
-        predicted_condition = saved_predicted_condition
     critical_failure_index = summary.get(
         "Critical Failure Index",
         summary.get("Critical Failure Flag"),
     )
-    safety_status = summary.get("Safety Override Status")
-    safety_highlight_active = _report_safety_override_active(critical_failure_index, safety_status)
-    safety_row_labels = {"CRITICAL FAILURE INDEX", "SAFETY OVERRIDE STATUS", "FINAL DECISION"}
 
+    story.append(Paragraph("Final Assessment", section_style))
     final_rows = [
-        ["CALCULATED FAI (MCDA)", _pdf_number(calculated_fai_value)],
         ["CALCULATED FAI CONDITION", calculated_condition],
-        ["AI-PREDICTED FAI (RANDOM FOREST)", _pdf_number(predicted_fai_value)],
         ["AI-PREDICTED FAI CONDITION", predicted_condition],
         ["CRITICAL FAILURE INDEX", critical_failure_index],
-        ["SAFETY OVERRIDE STATUS", safety_status],
+        ["SAFETY OVERRIDE STATUS", summary.get("Safety Override Status")],
         ["FINAL DECISION", summary.get("Final Decision")],
     ]
-    final_table_data = [[
-        Paragraph('<font color="#FFFFFF"><b>Assessment Item</b></font>', body_style),
-        Paragraph('<font color="#FFFFFF"><b>Result</b></font>', body_style),
-    ]]
-    final_table_commands = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F4C5C")),
-        ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#E8F3F0")),
-        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#91B9B0")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 3.5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
-    ]
-    for row_number, (label, value) in enumerate(final_rows, start=1):
-        label_markup = f"<b>{_pdf_safe_text(label)}</b>"
-        if safety_highlight_active and label in safety_row_labels:
-            value_markup = f'<font color="#FFFFFF"><b>{_pdf_safe_text(value)}</b></font>'
-            final_table_commands.append((
-                "BACKGROUND", (1, row_number), (1, row_number), colors.HexColor("#C00000")
-            ))
-        else:
-            value_markup = _pdf_safe_text(value)
-        final_table_data.append([
-            Paragraph(label_markup, body_style), Paragraph(value_markup, body_style)
-        ])
-    final_table = Table(
-        final_table_data,
-        colWidths=[100 * mm, 76 * mm],
-        repeatRows=1,
-        style=TableStyle(final_table_commands),
-    )
-    story.append(KeepTogether([
-        Paragraph("Final FAI Assessment and Safety Decision", section_style), final_table,
-    ]))
-
-
-    # Step 1: display the study's existing numerical FAI class boundaries.
-    # This reference table does not alter indices, weights or safety decisions.
-    classification_limits = [
-        ("Good", "70 ≤ FAI ≤ 100"),
-        ("Moderate", "55 ≤ FAI < 70"),
-        ("Poor", "40 ≤ FAI < 55"),
-        ("Critical", "0 ≤ FAI < 40"),
-    ]
-    classification_table_data = [
-        [Paragraph('<font color="#FFFFFF"><b>Classification</b></font>', body_style)]
-        + [
-            Paragraph(
-                '<font color="#FFFFFF"><b>' + _pdf_safe_text(label) + '</b></font>',
+    final_table_data = []
+    for idx, (label, value) in enumerate(final_rows):
+        if idx == 0:
+            label_paragraph = Paragraph(
+                f'<font color="#FFFFFF"><b>{_pdf_safe_text(label)}</b></font>',
                 body_style,
             )
-            for label, _ in classification_limits
-        ],
-        [Paragraph("<b>FAI range</b>", body_style)]
-        + [Paragraph(_pdf_safe_text(bounds), body_style)
-           for _, bounds in classification_limits],
-    ]
-    classification_table = Table(
-        classification_table_data,
-        colWidths=[38 * mm] + [34.5 * mm] * 4,
+            value_paragraph = Paragraph(
+                f'<font color="#FFFFFF"><b>{_pdf_safe_text(value)}</b></font>',
+                body_style,
+            )
+        else:
+            label_paragraph = Paragraph(f"<b>{_pdf_safe_text(label)}</b>", body_style)
+            value_paragraph = Paragraph(_pdf_safe_text(value), body_style)
+        final_table_data.append([label_paragraph, value_paragraph])
+    final_table = Table(
+        final_table_data,
+        colWidths=[88 * mm, 88 * mm],
         style=TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F4C5C")),
-            ("BACKGROUND", (0, 1), (0, 1), colors.HexColor("#E8F3F0")),
-            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#91B9B0")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#E8F3F0")),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#91B9B0")),
             ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D9D9")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 2.5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+            ("ALIGN", (1, 0), (1, -1), "CENTER"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ]),
     )
-    story.append(KeepTogether([
-        Paragraph("FAI Classification Limits", section_style),
-        classification_table,
-        Spacer(1, 1 * mm),
-        Paragraph(
-            "Classification limits adopted in this study; ranges refer to unrounded FAI values.",
-            center_small_style,
-        ),
-    ]))
+    story.append(final_table)
     story.append(Spacer(1, 2 * mm))
     story.append(
         Paragraph(
@@ -2723,145 +2914,57 @@ def build_assessment_pdf(
         )
     )
 
-    # Step 3: list every CF definition and its recorded activation state.
-    # The only narrative here is the assessor's own manually entered comment.
-    cf_rows = _critical_failure_report_rows(confirmed_critical_failures)
-    cf_table_data = [[
-        Paragraph("Code", body_bold_style),
-        Paragraph("Critical Failure Indicator", body_bold_style),
-        Paragraph("Status", body_bold_style),
-    ]]
-    cf_table_commands = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8F2F0")),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B9C8C5")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]
-    for row_number, row in enumerate(cf_rows, start=1):
-        is_active = row["Status"] == "Activated"
-        cells = []
-        for key in ("Code", "Critical Failure Indicator", "Status"):
-            text = _pdf_safe_text(row[key])
-            if is_active and key == "Status":
-                text = f'<font color="#FFFFFF"><b>{text}</b></font>'
-            cells.append(Paragraph(text, body_bold_style if key == "Code" else body_style))
-        cf_table_data.append(cells)
-        if is_active:
-            cf_table_commands.append((
-                "BACKGROUND", (2, row_number), (2, row_number),
-                colors.HexColor("#C00000"),
-            ))
-    cf_table = Table(
-        cf_table_data,
-        colWidths=[18 * mm, 125 * mm, 33 * mm],
-        repeatRows=1,
-        hAlign="LEFT",
-        style=TableStyle(cf_table_commands),
-    )
-    story.append(KeepTogether([
-        Spacer(1, 2 * mm),
-        Paragraph("Critical Failure Assessment", section_style),
-        cf_table,
-    ]))
-
-    comment_text = str(cf_assessor_comment or "").strip()
-    comment_heading = Paragraph("Assessor Comment", body_bold_style)
-    if comment_text:
-        # Escape ReportLab markup while retaining manually entered line breaks.
-        comment_text = comment_text.replace("\r\n", "\n").replace("\r", "\n")
-        comment_paragraph = Paragraph(
-            html.escape(comment_text).replace("\n", "<br/>"), body_style
+    confirmed_critical_failures = confirmed_critical_failures or []
+    if confirmed_critical_failures:
+        story.append(Spacer(1, 3 * mm))
+        story.append(
+            Table(
+                [[Paragraph(
+                    "<b>Confirmed Critical Failure Codes:</b> "
+                    + _pdf_safe_text(", ".join(confirmed_critical_failures)),
+                    body_style,
+                )]],
+                colWidths=[176 * mm],
+                style=TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FCE8E6")),
+                    ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#C00000")),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]),
+            )
         )
-        story.append(KeepTogether([Spacer(1, 2 * mm), comment_heading]))
-        story.append(comment_paragraph)
-    else:
-        # Leave three writable lines when the assessor has entered no comment.
-        blank_comment_lines = Table(
-            [[""], [""], [""]],
-            colWidths=[176 * mm],
-            rowHeights=[7 * mm, 7 * mm, 7 * mm],
-            hAlign="LEFT",
-            style=TableStyle([
-                ("LINEBELOW", (0, 0), (-1, -1), 0.35, colors.HexColor("#9BA9A6")),
-            ]),
-        )
-        story.append(KeepTogether([
-            Spacer(1, 2 * mm), comment_heading, blank_comment_lines,
-        ]))
 
-    # Step 5: recommendations come only from the assessor's manual entry.
-    # They are report text and never become model inputs or calculation rules.
-    recommendations_text = str(engineering_recommendations or "").strip()
-    recommendations_heading = Paragraph("Engineering Recommendations", section_style)
-    if recommendations_text:
-        recommendations_text = recommendations_text.replace("\r\n", "\n").replace("\r", "\n")
-        story.append(Spacer(1, 2 * mm))
-        story.append(recommendations_heading)
-        story.append(Paragraph(
-            html.escape(recommendations_text).replace("\n", "<br/>"), body_style
-        ))
-    else:
-        blank_recommendation_lines = Table(
-            [[""], [""], [""]],
-            colWidths=[176 * mm],
-            rowHeights=[7 * mm, 7 * mm, 7 * mm],
-            hAlign="LEFT",
-            style=TableStyle([
-                ("LINEBELOW", (0, 0), (-1, -1), 0.35, colors.HexColor("#9BA9A6")),
-            ]),
-        )
-        story.append(KeepTogether([
-            Spacer(1, 2 * mm), recommendations_heading, blank_recommendation_lines,
-        ]))
-
-    assessor_display = _excel_text(assessor_name or report_details.get("assessor_name"))
+    story.append(Spacer(1, 2 * mm))
+    assessor_display = (str(assessor_name).strip() if assessor_name else "")
     if not assessor_display:
         assessor_display = "____________________________"
-    signature_table = Table(
-        [
-            [Paragraph("<b>Assessor Name</b>", body_style),
-             Paragraph(_pdf_safe_text(assessor_display), body_style)],
-            [Paragraph("<b>Signature</b>", body_style),
-             Paragraph("____________________________", body_style)],
-        ],
-        colWidths=[32 * mm, 68 * mm],
-        hAlign="RIGHT",
-        style=TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ]),
-    )
-    # This block follows all report content and appears only at the end.
-    story.append(KeepTogether([Spacer(1, 6 * mm), signature_table]))
 
-    # Only continuation identification and page numbering repeat on each page.
+    # Assessor and signature are drawn in the lower-right page area instead of
+    # being part of the flowing story. This prevents the signature line from
+    # being pushed onto a second page when the report nearly fills page 1.
 
     def _draw_footer(canvas, document):
         canvas.saveState()
-        page_width, page_height = A4
+        page_width, _ = A4
 
-        if document.page > 1:
-            continuation_style = ParagraphStyle(
-                "AssessmentContinuation", parent=body_style,
-                fontSize=8, leading=9, textColor=colors.HexColor("#0F4C5C"),
+        # Assessor block - lower right, above the footer rule.
+        # The assessment report is intentionally designed as a concise one-page
+        # summary, so this keeps the assessor name and signature together.
+        if document.page == 1:
+            canvas.setFillColor(colors.HexColor("#111111"))
+            canvas.setFont("Helvetica-Bold", 8.5)
+            canvas.drawRightString(
+                page_width - 16 * mm,
+                23.0 * mm,
+                "ASSESSOR: " + assessor_display,
             )
-            continuation = Paragraph(
-                "<b>BUILDING ASSESSMENT SUMMARY REPORT</b> | Building ID: "
-                + _pdf_safe_text(summary.get("Building ID")),
-                continuation_style,
+            canvas.drawRightString(
+                page_width - 16 * mm,
+                17.5 * mm,
+                "SIGNATURE: ____________________________",
             )
-            continuation.wrap(176 * mm, 20 * mm)
-            continuation.drawOn(canvas, 16 * mm, page_height - 12 * mm)
-            canvas.setStrokeColor(colors.HexColor("#91B9B0"))
-            canvas.setLineWidth(0.4)
-            canvas.line(16 * mm, page_height - 13 * mm,
-                        page_width - 16 * mm, page_height - 13 * mm)
 
         canvas.setStrokeColor(colors.HexColor("#D9D9D9"))
         canvas.setLineWidth(0.4)
@@ -2908,7 +3011,7 @@ SESSION_DEFAULTS = {
 
     "latest_building_condition": None,
 
-    "latest_report_details": {},
+    "report_assessor_name": "",
 
     "latest_final_decision": None,
 
@@ -2916,13 +3019,7 @@ SESSION_DEFAULTS = {
 
     "latest_fai_scenario": None,
 
-    "latest_fai_calculation_results": None,
-
     "latest_confirmed_critical_failures": [],
-
-    "latest_cf_assessor_comment": "",
-
-    "latest_engineering_recommendations": "",
 
     "calculated_di": None,
 
@@ -5055,7 +5152,7 @@ elif selected_mode == "Calculate Assessment Indices":
                             "Damage_Contribution"
                         ]
 
-                        .max()
+                        .sum()
 
                         .rename(
                             columns={
@@ -5102,55 +5199,6 @@ elif selected_mode == "Calculate Assessment Indices":
 
                     .fillna(0.0)
                 )
-
-
-                # ============================================
-                # ELEMENT DI > 100 CHECK
-                # ============================================
-
-                if (
-
-                    element_results[
-                        "Element_DI"
-                    ] > 100
-
-                ).any():
-
-                    problem_elements = (
-
-                        element_results.loc[
-
-                            element_results[
-                                "Element_DI"
-                            ] > 100,
-
-                            "Element_ID",
-                        ]
-
-                        .tolist()
-                    )
-
-
-                    st.error(
-                        """
-                        Element DI exceeded 100 for:
-
-                        """
-                        + ", ".join(
-                            problem_elements
-                        )
-                        +
-                        """
-
-                        Review overlapping or duplicated
-                        damage extents.
-
-                        The application does not
-                        automatically cap the value.
-                        """
-                    )
-
-                    st.stop()
 
 
                 # ============================================
@@ -5216,6 +5264,8 @@ elif selected_mode == "Calculate Assessment Indices":
                     total_applied_weight
                 )
 
+                for review_message in _di_review_messages(element_results, final_di):
+                    st.warning(review_message)
 
                 # ============================================
                 # RESULT
@@ -5426,9 +5476,9 @@ elif selected_mode == "Calculate Assessment Indices":
 
                 st.success(
                     """
-                    The calculated DI has been stored
-                    for later use in the complete
-                    building assessment and AI model.
+                    The calculated DI has been stored.
+                    FAI calculation and AI input require a building DI
+                    within the accepted 0-100 range.
                     """
                 )
 
@@ -9395,11 +9445,38 @@ elif selected_mode == "Upload Completed Assessment Files":
             template_type = result["template_type"]
             st.write("**Detected Template:**", template_type)
 
+            for import_warning in result.get("Import_Warnings", []):
+                st.warning(import_warning)
+            provenance = result.get("Import_Provenance", {})
+            if provenance:
+                with st.expander("Calculation sources", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame(provenance.items(), columns=["Input", "Source"]),
+                        use_container_width=True, hide_index=True,
+                    )
+            comparison = result.get("Saved_Excel_Comparison")
+            if comparison is not None and not comparison.empty:
+                st.subheader("Saved Excel vs Recomputed B01")
+                st.caption(
+                    "PLI is compared as raw physical loss (100 minus a saved benefit score when needed). "
+                    "Saved Excel values are shown for comparison and do not drive the calculations."
+                )
+                if comparison["Status"].eq("Different").any():
+                    st.warning(
+                        "One or more saved Excel values differ from the recomputed B01 results. "
+                        "The assessment below uses the recomputed values; review the differences and source notes."
+                    )
+                st.dataframe(comparison, use_container_width=True, hide_index=True)
+
+            if template_type in {"DI", "Complete Building Assessment"}:
+                for review_message in _di_review_messages(result["di_elements"], result["DI"]):
+                    st.warning(review_message)
+
             if template_type == "DI":
                 st.metric("Damage Index (DI)", f"{float(result['DI']):.2f}")
                 st.info(
                     "DI has been loaded into the current session. "
-                    "It can now be used by Calculate All Indices."
+                    "FAI calculation requires the building DI to be within 0-100."
                 )
 
             elif template_type == "PLI":
@@ -9534,26 +9611,6 @@ elif selected_mode == "Results & Reports":
 
     else:
 
-        st.subheader("Report Details")
-        saved_report_details = st.session_state.get("latest_report_details") or {}
-        for field, widget_key in REPORT_DETAIL_WIDGET_FIELDS.items():
-            if widget_key not in st.session_state:
-                st.session_state[widget_key] = saved_report_details.get(
-                    field, None if field == "assessment_date" else ""
-                )
-        details_left, details_right = st.columns(2)
-        with details_left:
-            st.text_input("Beneficiary Entity", key="report_beneficiary_entity")
-            st.text_input("Report No.", key="report_number")
-            st.date_input(
-                "Assessment Date", key="report_assessment_date", value=None,
-                format="DD/MM/YYYY",
-            )
-        with details_right:
-            st.text_input("Assessing Entity", key="report_assessing_entity")
-            st.text_input("Inspection Name", key="report_inspection_name")
-        st.divider()
-
         st.dataframe(
 
             st.session_state.latest_assessment_summary,
@@ -9625,13 +9682,13 @@ elif selected_mode == "Results & Reports":
             "Not Available",
         )
 
-        st.subheader("Final FAI Assessment and Safety Decision")
+        st.subheader("Final Assessment")
         final_assessment_display = pd.DataFrame(
             [
-                ["CALCULATED FAI (MCDA)",
+                ["CALCULATED FAI",
                  f"{float(calculated_report_fai):.2f}" if calculated_report_fai is not None else "Not Available"],
                 ["CALCULATED FAI CONDITION", calculated_report_condition],
-                ["AI-PREDICTED FAI (RANDOM FOREST)",
+                ["AI-PREDICTED FAI",
                  f"{float(ai_report_fai):.2f}" if ai_report_fai is not None else "Not Available"],
                 ["AI-PREDICTED FAI CONDITION", ai_report_condition],
                 ["CRITICAL FAILURE INDEX", critical_failure_index],
@@ -9640,52 +9697,15 @@ elif selected_mode == "Results & Reports":
             ],
             columns=["Final Assessment Item", "Result"],
         )
-        st.markdown(
-            _recorded_safety_table_html(
-                final_assessment_display,
-                override_active=_report_safety_override_active(
-                    critical_failure_index, safety_status_for_report
-                ),
-            ),
-            unsafe_allow_html=True,
+        st.dataframe(
+            final_assessment_display,
+            use_container_width=True,
+            hide_index=True,
         )
         st.caption(
             "Calculated FAI and AI-Predicted FAI are reported independently. "
             "No arithmetic mean or fused FAI is calculated."
         )
-
-        st.subheader("Critical Failure Assessment")
-        st.markdown(
-            _recorded_safety_table_html(pd.DataFrame(_critical_failure_report_rows(
-                st.session_state.get("latest_confirmed_critical_failures", [])
-            ))),
-            unsafe_allow_html=True,
-        )
-        # Keep the comment outside the widget key so it survives page navigation.
-        if "report_cf_assessor_comment" not in st.session_state:
-            st.session_state["report_cf_assessor_comment"] = st.session_state.get(
-                "latest_cf_assessor_comment", ""
-            )
-        cf_assessor_comment = st.text_area(
-            "Assessor Comment",
-            key="report_cf_assessor_comment",
-            height=130,
-            placeholder="Enter your comment on the critical failure assessment here.",
-        )
-        st.session_state.latest_cf_assessor_comment = cf_assessor_comment
-
-        # This manual field belongs to the latest completed building assessment.
-        if "report_engineering_recommendations" not in st.session_state:
-            st.session_state["report_engineering_recommendations"] = st.session_state.get(
-                "latest_engineering_recommendations", ""
-            )
-        engineering_recommendations = st.text_area(
-            "Engineering Recommendations",
-            key="report_engineering_recommendations",
-            height=150,
-            placeholder="Enter your engineering recommendations for this building.",
-        )
-        st.session_state.latest_engineering_recommendations = engineering_recommendations
 
         _, assessor_col = st.columns([2, 1])
         with assessor_col:
@@ -9695,10 +9715,6 @@ elif selected_mode == "Results & Reports":
                 placeholder="Enter assessor name for the PDF report",
             )
             st.markdown("**Signature:** __________________________")
-        st.session_state.latest_report_details = {
-            field: st.session_state.get(widget_key)
-            for field, widget_key in REPORT_DETAIL_WIDGET_FIELDS.items()
-        }
 
         st.caption(
             "Result source: "
@@ -9708,13 +9724,10 @@ elif selected_mode == "Results & Reports":
         st.divider()
         st.subheader("PDF Assessment Report")
         st.caption(
-            "Download a report containing the entered report details and assessment date, "
-            "building information, "
+            "Download a dated summary report containing building information, "
             "Calculated FAI and its condition, AI-Predicted FAI and its condition, "
             "Critical Failure Index, Safety Override Status, "
-            "all three CF indicators and their titles, the assessor comment, "
-            "manually entered engineering recommendations, "
-            "Final Decision, and the assessor name and signature field at the end."
+            "Final Decision, assessor name, and signature field."
         )
 
         if REPORTLAB_AVAILABLE:
@@ -9730,12 +9743,6 @@ elif selected_mode == "Results & Reports":
                         "latest_confirmed_critical_failures", []
                     ),
                     assessor_name=st.session_state.get("report_assessor_name", ""),
-                    fai_details=st.session_state.get("latest_fai_calculation_results"),
-                    cf_assessor_comment=st.session_state.get("latest_cf_assessor_comment", ""),
-                    engineering_recommendations=st.session_state.get(
-                        "latest_engineering_recommendations", ""
-                    ),
-                    report_details=st.session_state.get("latest_report_details", {}),
                 )
 
                 st.download_button(
@@ -10060,7 +10067,13 @@ elif selected_mode == "AI Assessment from Existing Indices":
         ):
 
             di_default = float(st.session_state.calculated_di)
-
+            if not 0.0 <= di_default <= 100.0:
+                st.error(
+                    f"The stored building DI ({di_default:.6g}) is outside 0-100. "
+                    "Review its summed damage contributions before using AI assessment. "
+                    "The raw DI has not been capped."
+                )
+                st.stop()
 
         else:
 
@@ -10708,8 +10721,6 @@ elif selected_mode == "AI Assessment from Existing Indices":
             st.session_state.latest_assessment_summary = (
                 summary_df
             )
-            # Keep the report interpretation paired with this assessment.
-            st.session_state.latest_fai_calculation_results = calculated_fai_details.copy()
 
 
             st.session_state.latest_calculated_fai = (
@@ -10784,12 +10795,6 @@ elif selected_mode == "AI Assessment from Existing Indices":
                 }.items()
                 if int(flag) == 1
             ]
-            # Reset only when a new assessment is successfully completed.
-            st.session_state.latest_cf_assessor_comment = ""
-            st.session_state.pop("report_cf_assessor_comment", None)
-            st.session_state.latest_engineering_recommendations = ""
-            st.session_state.pop("report_engineering_recommendations", None)
-            _reset_assessment_report_details()
 
 
         except Exception as e:
