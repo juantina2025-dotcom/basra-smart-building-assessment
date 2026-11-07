@@ -10,6 +10,7 @@ import numpy as np
 import joblib
 import base64
 import html
+import hashlib
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -965,6 +966,275 @@ def _excel_number(value, field_name):
     return float(numeric_value)
 
 
+UPLOAD_ASSESSMENT_PROTOCOL = "B01_COUNT_AWARE_V1"
+
+
+def _upload_optional_number(value):
+    """Missing results stay missing; booleans and non-finite values are not indices."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number) or not np.isfinite(number):
+        return None
+    return float(number)
+
+
+def _format_upload_value(value, missing="Pending"):
+    number = _upload_optional_number(value)
+    return f"{number:.2f}" if number is not None else missing
+
+
+def _upload_ai_ready(result):
+    """Only a fresh, numerically complete import may populate Excel-mode AI inputs."""
+    if (not result
+            or result.get("template_type") != "Complete Building Assessment"
+            or result.get("Import_Protocol") != UPLOAD_ASSESSMENT_PROTOCOL):
+        return False
+    names = ["DI", "PLI", "SI", "FAI"]
+    flag = result.get("TRI_Availability_Flag")
+    if flag not in (0, 1):
+        return False
+    if flag == 1:
+        names.append("TRI")
+    values = [_upload_optional_number(result.get(name)) for name in names]
+    return all(value is not None and 0.0 <= value <= 100.0 for value in values)
+
+
+def _clear_upload_ai_fields():
+    for key in (
+        "ai_building_id", "ai_building_name", "ai_building_function",
+        "ai_structural_system", "ai_building_age", "ai_number_of_floors",
+        "ai_di", "ai_pli", "ai_tri", "ai_tri_status", "ai_si",
+        "ai_cf1", "ai_cf2", "ai_cf3", "ai_excel_function_unmapped",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state["ai_excel_pending_sync"] = False
+    st.session_state["ai_excel_input_selected"] = False
+
+
+def _clear_upload_derived_results():
+    """Invalidate results tied to the previous upload before loading new inputs."""
+    _clear_upload_ai_fields()
+    for key in (
+        "calculated_fai", "latest_calculated_fai", "latest_predicted_fai",
+        "latest_final_assessment_building_index", "latest_assessment_summary",
+        "latest_result_source", "latest_final_decision", "latest_fai_scenario",
+    ):
+        st.session_state[key] = None
+    for key in (
+        "calculated_fai_class", "latest_calculated_fai_class",
+        "latest_predicted_class", "latest_building_condition",
+    ):
+        st.session_state[key] = "Not Available"
+    st.session_state["fai_calculation_results"] = pd.DataFrame()
+    st.session_state["latest_confirmed_critical_failures"] = []
+    st.session_state.pop("uploaded_complete_assessment", None)
+
+
+def _attach_upload_element_counts(excel_file, elements, sheet_name):
+    """Read explicit counts by ID. Missing counts never imply one element per row."""
+    data = elements.copy()
+    context = _upload_import_context(excel_file)
+    if "Element_Count" in data.columns:
+        raw_counts = data["Element_Count"].copy()
+        if "Count_Source" in data.columns:
+            count_sources = data["Count_Source"].apply(_excel_text)
+        else:
+            count_sources = pd.Series("", index=data.index)
+        context["sources"]["DI element counts"] = f"{sheet_name}.Element_Count"
+    else:
+        records = {}
+        source_label = "Not provided; no one-element-per-row assumption"
+        if sheet_name == "Element_Inventory" and "Calculation_Details" in excel_file.sheet_names:
+            grid = _upload_sheet_grid(excel_file, "Calculation_Details")
+            required = {"Element_ID", "Element_Type", "Element_Count", "Count_Source"}
+            headings = []
+            for row_number in range(len(grid)):
+                row = [_excel_text(value) for value in grid.iloc[row_number]]
+                if required.issubset(set(row)):
+                    headings.append((row_number, row))
+            if len(headings) > 1:
+                raise ValueError("Calculation_Details contains ambiguous element-count tables.")
+            if headings:
+                header_row, headings_row = headings[0]
+                positions = {name: headings_row.index(name) for name in required}
+                source_label = f"Calculation_Details count inputs (header row {header_row + 1}; matched by Element_ID)"
+                inventory_types = data.set_index("Element_ID")["Element_Type"].to_dict()
+                for row_number in range(header_row + 1, len(grid)):
+                    values = {name: grid.iat[row_number, column] for name, column in positions.items()}
+                    if all(_excel_text(value) == "" for value in values.values()):
+                        break
+                    element_id = _excel_text(values["Element_ID"])
+                    if not element_id:
+                        raise ValueError(f"Calculation_Details count row {row_number + 1} lacks Element_ID.")
+                    if element_id not in inventory_types:
+                        raise ValueError(f"Calculation_Details count table references unknown Element_ID {element_id}.")
+                    if element_id in records:
+                        raise ValueError(f"Calculation_Details count table duplicates Element_ID {element_id}.")
+                    if _excel_text(values["Element_Type"]) != inventory_types[element_id]:
+                        raise ValueError(f"Calculation_Details count category disagrees with inventory for {element_id}.")
+                    records[element_id] = values
+        raw_counts = data["Element_ID"].map(
+            {key: record["Element_Count"] for key, record in records.items()}
+        )
+        count_sources = data["Element_ID"].map(
+            {key: _excel_text(record["Count_Source"]) for key, record in records.items()}
+        ).fillna("")
+        context["sources"]["DI element counts"] = source_label
+
+    missing_markers = {"", "not available", "not provided", "not documented", "pending", "n/a", "na", "unknown"}
+    missing = raw_counts.apply(_excel_text).str.lower().isin(missing_markers)
+    numeric = pd.to_numeric(raw_counts.where(~missing), errors="coerce")
+    boolean_values = raw_counts.map(lambda value: isinstance(value, (bool, np.bool_)))
+    invalid = ~missing & (
+        numeric.isna() | ~np.isfinite(numeric) | (numeric <= 0)
+        | ~np.isclose(numeric, np.round(numeric), rtol=0.0, atol=1e-9)
+        | boolean_values
+    )
+    if invalid.any():
+        raise ValueError(
+            "Element_Count must be a positive whole number when supplied. Review Element_ID: "
+            + ", ".join(data.loc[invalid, "Element_ID"].tolist())
+        )
+    data["Element_Count"] = numeric.astype(float)
+    data["Count_Source"] = count_sources
+    source_known = ~count_sources.str.lower().isin(
+        missing_markers | {"unsupported", "unverified", "not independently verified"}
+    )
+    # Explicit numeric counts are inputs, as in the workbook. A source reference
+    # qualifies their evidence status; it is not a numerical calculation gate.
+    data["Count_Provided"] = numeric.notna()
+    data["Count_Source_Provided"] = numeric.notna() & source_known
+    data["Count_Status"] = np.where(
+        data["Count_Source_Provided"], "User Provided - source recorded",
+        np.where(numeric.notna(), "User Provided - source pending", "Pending - count"),
+    )
+    missing_source_ids = data.loc[numeric.notna() & ~source_known, "Element_ID"].tolist()
+    if missing_source_ids:
+        context["warnings"].append(
+            "Source evidence is pending for explicitly supplied element counts: "
+            + ", ".join(missing_source_ids)
+            + ". These counts are used as user-provided inputs; they have not been independently verified."
+        )
+    data["Group_Rows_in_Category"] = data.groupby("Element_Type")["Element_ID"].transform("size")
+    data["Elements_in_Category"] = np.nan
+    data["Applied_Element_Weight"] = np.nan
+    for _, group in data.groupby("Element_Type"):
+        if group["Count_Provided"].all():
+            total = float(group["Element_Count"].sum())
+            if not np.isfinite(total) or total <= 0:
+                raise ValueError("The supplied category element-count total must be finite and positive.")
+            data.loc[group.index, "Elements_in_Category"] = total
+            data.loc[group.index, "Applied_Element_Weight"] = (
+                group["Category_AHP_Weight"] * group["Element_Count"] / total
+            )
+    return data
+
+
+def _explicit_sound_observation(row):
+    """Only an explicit sound/no-damage condition can replace an absent damage record."""
+    accepted_columns = {
+        "condition", "element_condition", "observed_condition", "source_condition",
+        "original_condition", "condition_status", "damage_status", "inspection_condition",
+    }
+    accepted_values = {
+        "sound", "undamaged", "no damage", "not damaged", "no observed damage",
+        "no visible damage", "intact", "سليم", "سليمة", "لا يوجد ضرر", "لا توجد أضرار",
+    }
+    for column, value in row.items():
+        if str(column).strip().lower().replace(" ", "_") in accepted_columns:
+            normalized = " ".join(_excel_text(value).lower().replace("_", " ").replace("-", " ").split())
+            if normalized in accepted_values:
+                return True
+    return False
+
+
+def _upload_source_qualifications(excel_file):
+    """Keep declared source-review qualifications separate from calculation checks."""
+    messages = []
+    if "PLI_Audit" in excel_file.sheet_names:
+        grid = _upload_sheet_grid(excel_file, "PLI_Audit")
+        for _, row in grid.iterrows():
+            if len(row) < 2:
+                continue
+            topic = _excel_text(row.iloc[0])
+            note = _excel_text(row.iloc[1])
+            if topic in {"AHP reciprocity", "SI provenance"} and note:
+                messages.append(f"Source review - {topic}: {note}")
+    return messages
+
+
+def _aggregate_b01_uploaded_di(elements, element_di_map):
+    elements = elements.copy()
+    elements["Element_DI"] = elements["Element_ID"].map(element_di_map)
+    elements["Damage_Record_Status"] = "Recorded damage"
+    unobserved = elements["Element_DI"].isna()
+    sound = elements.apply(_explicit_sound_observation, axis=1) & unobserved
+    elements.loc[sound, "Element_DI"] = 0.0
+    elements.loc[sound, "Damage_Record_Status"] = "Explicit sound observation"
+    elements.loc[unobserved & ~sound, "Damage_Record_Status"] = "Pending - no damage observation"
+    category_rows = []
+    pending_reasons = []
+    elements["Weighted_DI"] = np.nan
+    elements["Category_DI"] = np.nan
+    elements["DI_Count_Method"] = ""
+    for category, group in elements.groupby("Element_Type", sort=False):
+        weight = float(group["Category_AHP_Weight"].iloc[0])
+        grade = None
+        if group["Element_DI"].isna().any():
+            missing_ids = group.loc[group["Element_DI"].isna(), "Element_ID"].tolist()
+            method = "Pending - damage observation"
+            pending_reasons.append(
+                "DI Pending: no damage observation or explicit sound condition for "
+                + ", ".join(missing_ids) + ". Missing records are not scored as zero."
+            )
+        elif group["Count_Provided"].all():
+            counts = group["Element_Count"].astype(float)
+            grade = float((counts * group["Element_DI"]).sum() / counts.sum())
+            method = "Explicitly provided element counts"
+            elements.loc[group.index, "Weighted_DI"] = (
+                group["Applied_Element_Weight"] * group["Element_DI"]
+            )
+        elif len(group) == 1:
+            grade = float(group["Element_DI"].iloc[0])
+            method = "Algebraic cancellation - one group"
+            # This category's count cancels; the unknown count stays NaN.
+            elements.loc[group.index, "Applied_Element_Weight"] = weight
+            elements.loc[group.index, "Weighted_DI"] = weight * grade
+        elif np.allclose(
+            group["Element_DI"].to_numpy(dtype=float),
+            float(group["Element_DI"].iloc[0]), rtol=0.0, atol=1e-10,
+        ):
+            grade = float(group["Element_DI"].iloc[0])
+            method = "Algebraic cancellation - identical grades"
+            # Individual count shares remain unknown; do not split W equally.
+        else:
+            method = "Pending - actual element counts"
+            missing_ids = group.loc[~group["Count_Provided"], "Element_ID"].tolist()
+            pending_reasons.append(
+                f"DI Pending: {category} has unequal group grades and lacks explicit element counts for "
+                + ", ".join(missing_ids) + ". No one-element-per-row assumption is applied."
+            )
+        elements.loc[group.index, "DI_Count_Method"] = method
+        if grade is not None:
+            elements.loc[group.index, "Category_DI"] = grade
+        category_rows.append({
+            "Element_Type": category, "Category_AHP_Weight": weight,
+            "Category_DI": grade, "Count_Method": method,
+            "Weighted_Category_DI": weight * grade if grade is not None else None,
+        })
+    denominator = sum(row["Category_AHP_Weight"] for row in category_rows)
+    if denominator <= 0:
+        raise ValueError("The applicable DI category-weight sum is zero.")
+    di_value = (
+        None if pending_reasons
+        else float(sum(row["Weighted_Category_DI"] for row in category_rows) / denominator)
+    )
+    elements.attrs["pending_reasons"] = pending_reasons
+    elements.attrs["category_results"] = category_rows
+    return di_value, elements
+
+
 def _read_building_info(excel_file):
     if "Building_Info" not in excel_file.sheet_names:
         raise ValueError("The workbook does not contain a Building_Info sheet.")
@@ -1174,7 +1444,15 @@ def _compare_saved_excel(excel_file, info, result):
         if index_name == "TRI" and result.get("TRI_Availability_Flag") == 0:
             recalculated = None
         difference = None
-        if not source_exists or _excel_text(saved) == "":
+        if index_name in result.get("Pending_Indices", []) and recalculated is None:
+            status = "Pending"
+            if saved_numeric is not None:
+                status = "Stale saved value"
+                comparison.attrs["warnings"].append(
+                    f"Saved Excel {index_name} is numeric while the current B01 calculation is Pending. "
+                    "That saved value is not used as an input or sent to AI."
+                )
+        elif not source_exists or _excel_text(saved) == "":
             status = "Missing saved value"
         elif saved_numeric is None or recalculated is None:
             status = "Unavailable" if saved_numeric is None and recalculated is None else "Different"
@@ -1197,7 +1475,7 @@ def _compare_saved_excel(excel_file, info, result):
 def _upload_import_context(excel_file):
     context = getattr(excel_file, "_assessment_import_context", None)
     if context is None:
-        context = {"sources": {}, "warnings": [], "grids": {}, "formula_grids": {}}
+        context = {"sources": {}, "warnings": [], "infos": [], "grids": {}, "formula_grids": {}}
         excel_file._assessment_import_context = context
     return context
 
@@ -1226,12 +1504,13 @@ def _upload_sheet_grid(excel_file, sheet_name, formulas=False):
 
 
 def _upload_ahp_weights(excel_file, system):
-    weights, source, warnings = _read_upload_ahp_weights(excel_file, system)
+    weights, source, messages = _read_upload_ahp_weights(excel_file, system)
     context = _upload_import_context(excel_file)
     context["sources"]["AHP category weights"] = source
-    for warning in warnings:
-        if warning not in context["warnings"]:
-            context["warnings"].append(warning)
+    for message in messages:
+        target = "infos" if message.startswith("The workbook supplies its own AHP category weights") else "warnings"
+        if message not in context[target]:
+            context[target].append(message)
     return weights
 
 
@@ -1552,6 +1831,16 @@ def _read_active_pli_inputs(excel_file, elements):
                     f"Source {column} is Unsupported for: " + ", ".join(unsupported)
                     + ". Reproducing the active workbook calculation does not verify these quantities."
                 )
+    for column in adjusted.columns:
+        if "support_status" in str(column).lower():
+            supplied = adjusted.loc[
+                adjusted[column].apply(_excel_text).str.lower() == "user provided", "Element_ID"
+            ].tolist()
+            if supplied:
+                context["infos"].append(
+                    "User-provided quantities retained for: " + ", ".join(supplied)
+                    + ". User confirmation is recorded separately from independent measurement verification."
+                )
     if "Measurement_Basis" in adjusted:
         for category, group in adjusted.groupby("Element_Type"):
             units = set(group["Measurement_Basis"].apply(_excel_text)) - {""}
@@ -1563,6 +1852,17 @@ def _read_active_pli_inputs(excel_file, elements):
 
 def _finish_upload_review(excel_file, result):
     context = _upload_import_context(excel_file)
+    result["Import_Protocol"] = UPLOAD_ASSESSMENT_PROTOCOL
+    required = (
+        ["DI", "PLI", "SI", "FAI"] if result["template_type"] == "Complete Building Assessment"
+        else [result["template_type"]] if result["template_type"] in {"DI", "PLI", "SI"}
+        else []
+    )
+    result["Pending_Indices"] = [name for name in required if _upload_optional_number(result.get(name)) is None]
+    if "di_elements" in result:
+        context["warnings"].extend(_di_review_messages(result["di_elements"], result.get("DI")))
+        result["di_categories"] = pd.DataFrame(result["di_elements"].attrs.get("category_results", []))
+    context["warnings"].extend(_upload_source_qualifications(excel_file))
     if result["template_type"] == "Complete Building Assessment":
         comparison = _compare_saved_excel(excel_file, result["building_info"], result)
         result["Saved_Excel_Comparison"] = comparison
@@ -1570,6 +1870,13 @@ def _finish_upload_review(excel_file, result):
         context["sources"]["Saved PLI comparison"] = comparison.attrs.get("saved_sources", {}).get("PLI", "Unavailable")
     result["Import_Provenance"] = context["sources"].copy()
     result["Import_Warnings"] = list(dict.fromkeys(context["warnings"]))
+    result["Import_Info"] = list(dict.fromkeys(context["infos"]))
+    result["Assessment_Status"] = (
+        "Pending — input completion required" if result["Pending_Indices"]
+        else "Calculated — source review pending" if result["Import_Warnings"]
+        else "Calculated — input checks passed"
+    )
+    result["AI_Ready"] = _upload_ai_ready(result)
     return result
 
 
@@ -1637,42 +1944,7 @@ def _prepare_element_inventory(excel_file, system, sheet_name="Element_Inventory
 
     elements["Category_AHP_Weight"] = elements["Element_Type"].map(approved_weights).astype(float)
 
-    # Optional grouped-element support for standardized legacy-case conversion.
-    # If Element_Count is absent, every row represents one physical element,
-    # preserving the original application behavior.
-    if "Element_Count" in elements.columns:
-        element_count = pd.to_numeric(
-            elements["Element_Count"],
-            errors="coerce",
-        )
-        invalid_element_count = (
-            element_count.isna()
-            | (element_count <= 0)
-            | (~np.isclose(element_count, np.round(element_count)))
-        )
-        if invalid_element_count.any():
-            raise ValueError(
-                f"{sheet_name} Element_Count must be a positive whole number "
-                "for every entered element/group. Review Element_ID: "
-                + ", ".join(
-                    elements.loc[invalid_element_count, "Element_ID"].tolist()
-                )
-            )
-        elements["Element_Count"] = np.round(element_count).astype(int)
-    else:
-        elements["Element_Count"] = 1
-
-    elements["Elements_in_Category"] = (
-        elements.groupby("Element_Type")["Element_Count"]
-        .transform("sum")
-        .astype(int)
-    )
-
-    elements["Applied_Element_Weight"] = (
-        elements["Category_AHP_Weight"]
-        * elements["Element_Count"]
-        / elements["Elements_in_Category"]
-    )
+    elements = _attach_upload_element_counts(excel_file, elements, sheet_name)
 
     if require_quantity:
         elements["Total_Quantity"] = pd.to_numeric(
@@ -1694,8 +1966,8 @@ def _prepare_element_inventory(excel_file, system, sheet_name="Element_Inventory
 
 
 def _di_review_messages(elements, di_value):
-    """Report B01 sum diagnostics without changing the calculated values."""
-    messages = []
+    """Report B01 count/damage gaps and uncapped sums without inventing results."""
+    messages = list(elements.attrs.get("pending_reasons", []))
     over_limit = elements.loc[elements["Element_DI"] > 100.0]
     if len(over_limit) > 0:
         element_values = ", ".join(
@@ -1704,15 +1976,13 @@ def _di_review_messages(elements, di_value):
         )
         messages.append(
             "CHECK ELEMENT DI >100: " + element_values
-            + ". The uncapped B01 sums are retained. Review overlapping "
-            "or duplicated damage records."
+            + ". The uncapped B01 sums are retained. Review overlapping or duplicated damage records."
         )
-    numeric_di = float(di_value)
-    if not 0.0 <= numeric_di <= 100.0:
+    numeric_di = _upload_optional_number(di_value)
+    if numeric_di is not None and not 0.0 <= numeric_di <= 100.0:
         messages.append(
             f"Building DI ({numeric_di:.6g}) is outside the accepted 0-100 range. "
-            "The raw result is retained for review; it cannot be used to calculate FAI "
-            "or as an AI input until the source assessment is resolved. No cap is applied."
+            "The raw result is retained for review; FAI and Excel-mode AI remain unavailable. No cap is applied."
         )
     return messages
 
@@ -1783,20 +2053,7 @@ def _extract_di_from_excel(excel_file, info):
         damages["Damage_Contribution"] = pd.Series(dtype=float)
         element_di_map = {}
 
-    elements["Element_DI"] = elements["Element_ID"].map(element_di_map).fillna(0.0)
-
-    # Element sums above 100 are B01 review flags, not capped or discarded.
-    # The building DI is checked against 0-100 before any FAI calculation.
-
-    denominator = float(elements["Applied_Element_Weight"].sum())
-    if denominator <= 0:
-        raise ValueError("The applied DI element-weight sum is zero.")
-
-    elements["Weighted_DI"] = (
-        elements["Applied_Element_Weight"]
-        * elements["Element_DI"]
-    )
-    di_value = float(elements["Weighted_DI"].sum() / denominator)
+    di_value, elements = _aggregate_b01_uploaded_di(elements, element_di_map)
 
     return di_value, system, elements, damages
 
@@ -2135,9 +2392,12 @@ def _extract_si_from_excel(excel_file, info):
                 raise ValueError(
                     f"{criterion_code} is Applicable but Assessment_Score_1_5 is missing."
                 )
-            if not float(numeric_score).is_integer():
+            if (isinstance(row["Assessment_Score_1_5"], (bool, np.bool_))
+                    or not np.isfinite(numeric_score)
+                    or not float(numeric_score).is_integer()
+                    or not 1 <= numeric_score <= 5):
                 raise ValueError(
-                    f"{criterion_code}: Assessment_Score_1_5 must be an integer from 1 to 5."
+                    f"{criterion_code}: Assessment_Score_1_5 must be a finite integer from 1 to 5."
                 )
             numeric_score = int(numeric_score)
             if numeric_score not in score_map:
@@ -2217,72 +2477,47 @@ def _extract_safety_override(excel_file):
 
 
 def _calculate_fai_from_indices(di_value, pli_value, tri_value, tri_flag, si_value):
-    required_values = {
-        "DI": float(di_value),
-        "PLI": float(pli_value),
-        "SI": float(si_value),
-    }
-    if int(tri_flag) == 1:
-        required_values["TRI"] = float(tri_value)
-
-    invalid = [
-        name for name, value in required_values.items()
-        if value < 0 or value > 100
-    ]
-    if invalid:
-        raise ValueError(
-            "The following indices fall outside 0–100: "
-            + ", ".join(invalid)
-        )
-
-    tri_is_available = int(tri_flag) == 1 and tri_value is not None
-    if tri_is_available:
-        scenario = "Full 4-Index Assessment"
-        weights = FULL_FAI_UPLOAD_WEIGHTS.copy()
-    else:
-        scenario = "TRI Not Available – 3-Index Assessment"
-        weights = NO_TRI_FAI_UPLOAD_WEIGHTS.copy()
-
-    converted = {
-        "DI": 100.0 - float(di_value),
-        "PLI": 100.0 - float(pli_value),
-        "SI": float(si_value),
-    }
-    if tri_is_available:
-        converted["TRI"] = float(tri_value)
-
+    if tri_flag not in (0, 1):
+        raise ValueError("TRI_Availability_Flag must be 0 or 1.")
     raw_values = {
-        "DI": float(di_value),
-        "PLI": float(pli_value),
-        "TRI": float(tri_value) if tri_is_available else None,
-        "SI": float(si_value),
+        "DI": _upload_optional_number(di_value),
+        "PLI": _upload_optional_number(pli_value),
+        "TRI": _upload_optional_number(tri_value) if tri_flag == 1 else None,
+        "SI": _upload_optional_number(si_value),
     }
+    weights = FULL_FAI_UPLOAD_WEIGHTS.copy() if tri_flag == 1 else NO_TRI_FAI_UPLOAD_WEIGHTS.copy()
+    base_scenario = "Full 4-Index Assessment" if tri_flag == 1 else "TRI Not Available – 3-Index Assessment"
+    required = ["DI", "PLI", "SI"] + (["TRI"] if tri_flag == 1 else [])
+    missing = [name for name in required if raw_values[name] is None]
+    outside = [name for name in required if raw_values[name] is not None and not 0.0 <= raw_values[name] <= 100.0]
     directions = {
-        "DI": "Adverse → 100 − DI",
-        "PLI": "Adverse → 100 − PLI",
-        "TRI": "Benefit",
-        "SI": "Benefit",
+        "DI": "Adverse → 100 − DI", "PLI": "Adverse → 100 − PLI",
+        "TRI": "Benefit", "SI": "Benefit",
     }
-
     rows = []
-    fai_value = 0.0
-    for index_name in ["DI", "PLI", "TRI", "SI"]:
-        weight = float(weights.get(index_name, 0.0))
+    for name in ["DI", "PLI", "TRI", "SI"]:
+        weight = float(weights.get(name, 0.0))
         if weight <= 0:
             continue
-        contribution = float(converted[index_name]) * weight
-        fai_value += contribution
+        value = raw_values[name]
+        converted = None
+        if value is not None and 0.0 <= value <= 100.0:
+            converted = 100.0 - value if name in {"DI", "PLI"} else value
         rows.append({
-            "Index": index_name,
-            "Index_Value": raw_values[index_name],
-            "Direction": directions[index_name],
-            "Converted_Score": float(converted[index_name]),
-            "Applied_Weight": weight,
-            "FAI_Contribution": contribution,
+            "Index": name, "Index_Value": value, "Direction": directions[name],
+            "Converted_Score": converted, "Applied_Weight": weight,
+            "FAI_Contribution": None if converted is None else converted * weight,
         })
-
-    fai_value = max(0.0, min(100.0, float(fai_value)))
-    return fai_value, get_fai_class(fai_value), scenario, pd.DataFrame(rows)
+    details = pd.DataFrame(rows)
+    if missing or outside:
+        reasons = []
+        if missing:
+            reasons.append("missing " + ", ".join(missing))
+        if outside:
+            reasons.append("outside 0–100: " + ", ".join(outside))
+        return None, "Not Available", "Pending — " + "; ".join(reasons) + " (" + base_scenario + ")", details
+    fai_value = max(0.0, min(100.0, float(sum(row["FAI_Contribution"] for row in rows))))
+    return fai_value, get_fai_class(fai_value), base_scenario, details
 
 
 def _validate_complete_building_info(info):
@@ -2449,125 +2684,109 @@ def process_uploaded_assessment_workbook(file_bytes):
 
 def load_uploaded_result_into_session(result):
     template_type = result["template_type"]
-
+    _clear_upload_derived_results()
     if template_type in {"DI", "Complete Building Assessment"}:
-        st.session_state.calculated_di = float(result["DI"])
+        st.session_state.calculated_di = _upload_optional_number(result.get("DI"))
         st.session_state.di_structural_system_used = result["di_system"]
         st.session_state.di_element_results = result["di_elements"].copy()
         st.session_state.di_damage_results = result["di_damage"].copy()
-
     if template_type in {"PLI", "Complete Building Assessment"}:
-        st.session_state.calculated_pli = float(result["PLI"])
+        st.session_state.calculated_pli = _upload_optional_number(result.get("PLI"))
         st.session_state.pli_structural_system_used = result["pli_system"]
         st.session_state.pli_element_results = result["pli_elements"].copy()
         st.session_state.pli_loss_results = result["pli_losses"].copy()
-
     if template_type in {"TRI", "Complete Building Assessment"}:
         tri_flag = int(result["TRI_Availability_Flag"])
         st.session_state.tri_availability_flag = tri_flag
         st.session_state.tri_status = result["TRI_Status"]
-        st.session_state.calculated_tri = (
-            float(result["TRI"])
-            if tri_flag == 1 and result["TRI"] is not None
-            else None
-        )
+        st.session_state.calculated_tri = _upload_optional_number(result.get("TRI")) if tri_flag == 1 else None
         st.session_state.tri_structural_system_used = result["tri_system"]
         st.session_state.tri_test_results = result["tri_tests"].copy()
         st.session_state.tri_element_results = result["tri_elements"].copy()
-
     if template_type in {"SI", "Complete Building Assessment"}:
-        st.session_state.calculated_si = float(result["SI"])
+        st.session_state.calculated_si = _upload_optional_number(result.get("SI"))
         st.session_state.si_criteria_results = result["si_details"].copy()
         st.session_state.si_applicable_weight_sum = float(result["si_weight_sum"])
         st.session_state.si_heritage_status = result["si_heritage"]
+    if template_type != "Complete Building Assessment":
+        return
 
-    if template_type == "Complete Building Assessment":
-        st.session_state.calculated_fai = float(result["FAI"])
-        st.session_state.calculated_fai_class = result["FAI_Condition_Class"]
-        st.session_state.fai_scenario = result["FAI_Scenario"]
-        st.session_state.fai_calculation_results = result["fai_details"].copy()
+    fai = _upload_optional_number(result.get("FAI"))
+    st.session_state.calculated_fai = fai
+    st.session_state.calculated_fai_class = result["FAI_Condition_Class"]
+    st.session_state.fai_scenario = result["FAI_Scenario"]
+    st.session_state.fai_calculation_results = result["fai_details"].copy()
+    info = result["building_info"]
+    critical_flag = int(result["Critical_Failure_Flag"])
+    final_decision = (
+        "Immediate Action Required" if critical_flag == 1
+        else "Pending — assessment inputs incomplete" if fai is None
+        else "Condition-Based Decision - " + result["FAI_Condition_Class"]
+    )
 
-        info = result["building_info"]
-        critical_flag = int(result["Critical_Failure_Flag"])
-        final_decision = (
-            "Immediate Action Required"
-            if critical_flag == 1
-            else "Condition-Based Decision - " + result["FAI_Condition_Class"]
-        )
+    def summary_number(name):
+        value = _upload_optional_number(result.get(name))
+        return round(value, 2) if value is not None else "Not Available"
 
-        summary_data = {
-            "Result Source": "Uploaded Complete Assessment Template",
-            "Building ID": _excel_text(info.get("Building_ID")),
-            "Building Name": _excel_text(info.get("Building_Name")),
-            "Building Function": _excel_text(info.get("Building_Function")),
-            "Structural System": _excel_text(info.get("Structural_System")),
-            "Building Age (Years)": _excel_text(info.get("Building_Age_Years")),
-            "Number of Floors": _excel_text(info.get("Number_of_Floors")),
-            "DI": round(float(result["DI"]), 2),
-            "PLI": round(float(result["PLI"]), 2),
-            "TRI Availability": result["TRI_Status"],
-            "TRI": (
-                round(float(result["TRI"]), 2)
-                if int(result["TRI_Availability_Flag"]) == 1
-                else "Not Available"
-            ),
-            "SI": round(float(result["SI"]), 2),
-            "Calculated FAI": round(float(result["FAI"]), 2),
-            "AI-Predicted FAI": "Not Available",
-            "Calculated FAI (MCDA)": round(float(result["FAI"]), 2),
-            "Building Condition": result["FAI_Condition_Class"],
-            "FAI Scenario": result["FAI_Scenario"],
-            "Critical Failure Index": critical_flag,
-            "Safety Override Status": result["Safety_Override_Status"],
-            "Final Decision": final_decision,
-        }
-
-        st.session_state.latest_assessment_summary = pd.DataFrame(
-            summary_data.items(),
-            columns=["Assessment Item", "Value"],
-        )
-        st.session_state.latest_calculated_fai = float(result["FAI"])
-        st.session_state.latest_calculated_fai_class = result["FAI_Condition_Class"]
-        st.session_state.latest_predicted_fai = None
-        st.session_state.latest_predicted_class = None
-        st.session_state.latest_final_assessment_building_index = float(result["FAI"])
-        st.session_state.latest_building_condition = result["FAI_Condition_Class"]
-        st.session_state.latest_final_decision = final_decision
-        st.session_state.latest_result_source = "Uploaded Assessment Template"
-        st.session_state.latest_fai_scenario = result["FAI_Scenario"]
-        st.session_state.latest_confirmed_critical_failures = list(
-            result.get("Confirmed_Critical_Failures", [])
-        )
-
-        # Sync the separate AI assessment screen to this exact uploaded workbook.
-        # This does not change the deterministic index equations or AHP weights.
-        st.session_state["uploaded_complete_assessment"] = result
-        # Keep a non-widget flag: Streamlit may discard keyed AI widgets when
-        # navigating away from their page. Rehydrate them on the next AI visit.
-        st.session_state["ai_excel_pending_sync"] = True
-        st.session_state["ai_excel_input_selected"] = True
-        # Newly validated complete workbooks become the active AI input source.
-        st.session_state["ai_input_mode"] = "From uploaded Excel"
-        st.session_state["ai_building_id"] = _excel_text(info.get("Building_ID"))
-        st.session_state["ai_building_name"] = _excel_text(info.get("Building_Name"))
-        st.session_state["ai_building_function"] = _excel_text(info.get("Building_Function"))
-        st.session_state["ai_structural_system"] = _normalize_structural_system(info.get("Structural_System"))
-        st.session_state["ai_building_age"] = int(float(info.get("Building_Age_Years")))
-        st.session_state["ai_number_of_floors"] = int(float(info.get("Number_of_Floors")))
-        st.session_state["ai_di"] = float(result["DI"])
-        st.session_state["ai_pli"] = float(result["PLI"])
-        st.session_state["ai_si"] = float(result["SI"])
-        st.session_state["ai_tri_status"] = (
-            "Available" if int(result["TRI_Availability_Flag"]) == 1
-            else "Not Available"
-        )
-        st.session_state["ai_tri"] = (
-            float(result["TRI"]) if int(result["TRI_Availability_Flag"]) == 1
-            else 70.0  # Only an inactive widget placeholder when TRI is unavailable.
-        )
-        confirmed_codes = set(result.get("Confirmed_Critical_Failures", []))
-        for code in ("CF1", "CF2", "CF3"):
-            st.session_state[f"ai_{code.lower()}"] = code in confirmed_codes
+    summary_data = {
+        "Result Source": "Uploaded Assessment Template",
+        "Assessment Status": result.get("Assessment_Status", "Source review pending"),
+        "Pending Indices": ", ".join(result.get("Pending_Indices", [])) or "None",
+        "Source Review Notes": " | ".join(result.get("Import_Warnings", [])) or "No additional source warning recorded",
+        "Building ID": _excel_text(info.get("Building_ID")),
+        "Building Name": _excel_text(info.get("Building_Name")),
+        "Building Function": _excel_text(info.get("Building_Function")),
+        "Structural System": _excel_text(info.get("Structural_System")),
+        "Building Age (Years)": _excel_text(info.get("Building_Age_Years")),
+        "Number of Floors": _excel_text(info.get("Number_of_Floors")),
+        "DI": summary_number("DI"), "PLI": summary_number("PLI"),
+        "TRI Availability": result["TRI_Status"],
+        "TRI": summary_number("TRI") if int(result["TRI_Availability_Flag"]) == 1 else "Not Available",
+        "SI": summary_number("SI"),
+        "Calculated FAI": summary_number("FAI"),
+        "AI-Predicted FAI": "Not Available",
+        "Calculated FAI (MCDA)": summary_number("FAI"),
+        "Building Condition": result["FAI_Condition_Class"],
+        "FAI Scenario": result["FAI_Scenario"],
+        "Critical Failure Index": critical_flag,
+        "Safety Override Status": result["Safety_Override_Status"],
+        "Final Decision": final_decision,
+    }
+    st.session_state.latest_assessment_summary = pd.DataFrame(
+        summary_data.items(), columns=["Assessment Item", "Value"]
+    )
+    st.session_state.latest_calculated_fai = fai
+    st.session_state.latest_calculated_fai_class = result["FAI_Condition_Class"]
+    st.session_state.latest_predicted_fai = None
+    st.session_state.latest_predicted_class = "Not Available"
+    st.session_state.latest_final_assessment_building_index = fai
+    st.session_state.latest_building_condition = result["FAI_Condition_Class"]
+    st.session_state.latest_final_decision = final_decision
+    st.session_state.latest_result_source = "Uploaded Assessment Template — " + result.get("Assessment_Status", "Source review pending")
+    st.session_state.latest_fai_scenario = result["FAI_Scenario"]
+    st.session_state.latest_confirmed_critical_failures = list(result.get("Confirmed_Critical_Failures", []))
+    st.session_state["uploaded_complete_assessment"] = result
+    # Pending imports are current for reporting but cannot populate AI widgets.
+    st.session_state["ai_input_mode"] = "From uploaded Excel"
+    st.session_state["ai_excel_input_selected"] = True
+    if not _upload_ai_ready(result):
+        st.session_state["ai_excel_pending_sync"] = False
+        return
+    st.session_state["ai_excel_pending_sync"] = True
+    st.session_state["ai_building_id"] = _excel_text(info.get("Building_ID"))
+    st.session_state["ai_building_name"] = _excel_text(info.get("Building_Name"))
+    st.session_state["ai_building_function"] = _excel_text(info.get("Building_Function"))
+    st.session_state["ai_structural_system"] = _normalize_structural_system(info.get("Structural_System"))
+    st.session_state["ai_building_age"] = int(float(info.get("Building_Age_Years")))
+    st.session_state["ai_number_of_floors"] = int(float(info.get("Number_of_Floors")))
+    for field, index in (("ai_di", "DI"), ("ai_pli", "PLI"), ("ai_si", "SI")):
+        st.session_state[field] = float(result[index])
+    available = int(result["TRI_Availability_Flag"]) == 1
+    st.session_state["ai_tri_status"] = "Available" if available else "Not Available"
+    st.session_state["ai_tri"] = float(result["TRI"]) if available else 70.0
+    confirmed = set(result.get("Confirmed_Critical_Failures", []))
+    for code in ("CF1", "CF2", "CF3"):
+        st.session_state[f"ai_{code.lower()}"] = code in confirmed
 
 
 
@@ -2647,7 +2866,7 @@ def _optional_fai_value(value):
     except Exception:
         return None
 
-    if numeric < 0 or numeric > 100:
+    if not np.isfinite(numeric) or numeric < 0 or numeric > 100:
         return None
     return numeric
 
@@ -2831,6 +3050,21 @@ def build_assessment_pdf(
         )
     )
 
+    if summary.get("Assessment Status"):
+        story.append(Paragraph(
+            "<b>Assessment status:</b> " + _pdf_safe_text(summary.get("Assessment Status")),
+            body_style,
+        ))
+        story.append(Paragraph(
+            "<b>Pending indices:</b> " + _pdf_safe_text(summary.get("Pending Indices", "None")),
+            body_style,
+        ))
+        if summary.get("Source Review Notes"):
+            story.append(Paragraph(
+                "<b>Source review:</b> " + _pdf_safe_text(summary.get("Source Review Notes")),
+                body_style,
+            ))
+        story.append(Spacer(1, 3 * mm))
     story.append(Paragraph("Assessment Levels", section_style))
     calculated_fai_value = summary.get("Calculated FAI", summary.get("FAI"))
     predicted_fai_value = summary.get("AI-Predicted FAI", summary.get("Predicted FAI"))
@@ -9410,10 +9644,10 @@ elif selected_mode == "Upload Completed Assessment Files":
 
     st.markdown(
         """
-        Upload a completed **DI, PLI, TRI, SI, or Complete Building Assessment**
-        `.xlsx` template. The application validates the entered data and
+        Upload a **DI, PLI, TRI, SI, or Complete Building Assessment**
+        `.xlsx` template. The application checks the entered data and
         **recalculates the index from the source inputs** rather than trusting
-        a manually typed summary value.
+        a manually typed summary value. Missing required counts or observations remain **Pending**.
         """
     )
 
@@ -9429,9 +9663,10 @@ elif selected_mode == "Upload Completed Assessment Files":
     else:
         current_upload_signature = (
             uploaded_assessment_file.name,
-            int(uploaded_assessment_file.size),
+            hashlib.sha256(uploaded_assessment_file.getvalue()).hexdigest(),
         )
         if st.session_state.get("last_uploaded_template_signature") != current_upload_signature:
+            _clear_upload_derived_results()
             st.session_state["last_uploaded_template_result"] = None
             st.session_state["last_uploaded_template_signature"] = current_upload_signature
 
@@ -9454,9 +9689,13 @@ elif selected_mode == "Upload Completed Assessment Files":
                 load_uploaded_result_into_session(result)
 
                 st.session_state["last_uploaded_template_result"] = result
-                st.success(
-                    f"{result['template_type']} template validated and loaded successfully."
-                )
+                if result.get("Pending_Indices"):
+                    st.warning("Assessment loaded for completion. Required indices remain Pending: "
+                               + ", ".join(result["Pending_Indices"]) + ".")
+                elif result.get("Import_Warnings"):
+                    st.info("Assessment calculations loaded; source review remains pending.")
+                else:
+                    st.success(f"{result['template_type']} calculations loaded successfully.")
 
             except Exception as exc:
                 st.session_state["last_uploaded_template_result"] = None
@@ -9464,14 +9703,22 @@ elif selected_mode == "Upload Completed Assessment Files":
                 st.exception(exc)
 
         result = st.session_state.get("last_uploaded_template_result")
+        if result is not None and result.get("Import_Protocol") != UPLOAD_ASSESSMENT_PROTOCOL:
+            _clear_upload_derived_results()
+            st.session_state["last_uploaded_template_result"] = None
+            result = None
+            st.info("Check and load this workbook again to apply the current B01 count requirements.")
 
         if result is not None:
             st.divider()
-            st.subheader("Validated Uploaded Results")
+            st.subheader("Uploaded Assessment Results")
+            st.write("**Assessment Status:**", result.get("Assessment_Status", "Reload to apply current count checks."))
 
             template_type = result["template_type"]
             st.write("**Detected Template:**", template_type)
 
+            for import_info in result.get("Import_Info", []):
+                st.info(import_info)
             for import_warning in result.get("Import_Warnings", []):
                 st.warning(import_warning)
             provenance = result.get("Import_Provenance", {})
@@ -9488,7 +9735,7 @@ elif selected_mode == "Upload Completed Assessment Files":
                     "PLI is compared as raw physical loss (100 minus a saved benefit score when needed). "
                     "Saved Excel values are shown for comparison and do not drive the calculations."
                 )
-                if comparison["Status"].eq("Different").any():
+                if comparison["Status"].isin(["Different", "Stale saved value"]).any():
                     st.warning(
                         "One or more saved Excel values differ from the recomputed B01 results. "
                         "The assessment below uses the recomputed values; review the differences and source notes."
@@ -9500,14 +9747,15 @@ elif selected_mode == "Upload Completed Assessment Files":
                     st.warning(review_message)
 
             if template_type == "DI":
-                st.metric("Damage Index (DI)", f"{float(result['DI']):.2f}")
+                st.metric("Damage Index (DI)", _format_upload_value(result.get("DI")))
                 st.info(
-                    "DI has been loaded into the current session. "
-                    "FAI calculation requires the building DI to be within 0-100."
+                    "DI remains Pending until the required counts and observations are available."
+                    if result.get("DI") is None else
+                    "DI has been loaded. FAI requires the building DI to be within 0-100."
                 )
 
             elif template_type == "PLI":
-                st.metric("Physical Loss Index (PLI)", f"{float(result['PLI']):.2f}")
+                st.metric("Physical Loss Index (PLI)", _format_upload_value(result.get("PLI")))
                 st.info(
                     "PLI has been loaded into the current session. "
                     "It can now be used by Calculate All Indices."
@@ -9515,7 +9763,7 @@ elif selected_mode == "Upload Completed Assessment Files":
 
             elif template_type == "TRI":
                 if int(result["TRI_Availability_Flag"]) == 1:
-                    st.metric("Test Result Index (TRI)", f"{float(result['TRI']):.2f}")
+                    st.metric("Test Result Index (TRI)", _format_upload_value(result.get("TRI")))
                 else:
                     st.metric("Test Result Index (TRI)", "Not Available")
                 st.caption(
@@ -9527,7 +9775,7 @@ elif selected_mode == "Upload Completed Assessment Files":
                 )
 
             elif template_type == "SI":
-                st.metric("Sustainability Index (SI)", f"{float(result['SI']):.2f}")
+                st.metric("Sustainability Index (SI)", _format_upload_value(result.get("SI")))
                 st.info(
                     "SI has been loaded into the current session. "
                     "It can now be used by Calculate All Indices."
@@ -9536,22 +9784,22 @@ elif selected_mode == "Upload Completed Assessment Files":
             else:
                 metric1, metric2, metric3, metric4 = st.columns(4)
                 with metric1:
-                    st.metric("DI", f"{float(result['DI']):.2f}")
+                    st.metric("DI", _format_upload_value(result.get("DI")))
                 with metric2:
-                    st.metric("PLI", f"{float(result['PLI']):.2f}")
+                    st.metric("PLI", _format_upload_value(result.get("PLI")))
                 with metric3:
                     st.metric(
                         "TRI",
-                        f"{float(result['TRI']):.2f}"
+                        _format_upload_value(result.get("TRI"))
                         if int(result["TRI_Availability_Flag"]) == 1
                         else "Not Available",
                     )
                 with metric4:
-                    st.metric("SI", f"{float(result['SI']):.2f}")
+                    st.metric("SI", _format_upload_value(result.get("SI")))
 
                 result_col1, result_col2, result_col3 = st.columns(3)
                 with result_col1:
-                    st.metric("FAI", f"{float(result['FAI']):.2f}")
+                    st.metric("FAI", _format_upload_value(result.get("FAI")))
                 with result_col2:
                     st.metric("Condition Class", result["FAI_Condition_Class"])
                 with result_col3:
@@ -9582,7 +9830,8 @@ elif selected_mode == "Upload Completed Assessment Files":
                     )
 
                 st.info(
-                    "The complete assessment has also been loaded into Results & Reports."
+                    "This assessment, including its Pending/source-review status and separate safety decision, "
+                    "is available in Results & Reports."
                 )
 
             st.divider()
@@ -9595,7 +9844,7 @@ elif selected_mode == "Upload Completed Assessment Files":
             current_si = st.session_state.get("calculated_si")
 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("DI", f"{float(current_di):.2f}" if current_di is not None else "Not Loaded")
+            c1.metric("DI", _format_upload_value(current_di, missing="Pending" if "DI" in result else "Not Loaded"))
             c2.metric("PLI", f"{float(current_pli):.2f}" if current_pli is not None else "Not Loaded")
             c3.metric(
                 "TRI",
@@ -9890,8 +10139,9 @@ elif selected_mode == "AI Assessment from Existing Indices":
 
     def _set_ai_fields_from_excel():
         record = st.session_state.get("uploaded_complete_assessment")
-        if record is None:
-            return
+        if not _upload_ai_ready(record):
+            _clear_upload_ai_fields()
+            return False
         info = record["building_info"]
         st.session_state["ai_building_id"] = _excel_text(info.get("Building_ID"))
         st.session_state["ai_building_name"] = _excel_text(info.get("Building_Name"))
@@ -9938,7 +10188,7 @@ elif selected_mode == "AI Assessment from Existing Indices":
     # This section is a separate Streamlit page. Widget keys can be cleaned
     # up when leaving their page, while uploaded_complete_assessment persists.
     # Restore values *before* the widgets are constructed, not afterwards.
-    if _excel_assessment is not None:
+    if _upload_ai_ready(_excel_assessment):
         if st.session_state.get("ai_excel_pending_sync"):
             st.session_state["ai_input_mode"] = "From uploaded Excel"
             _set_ai_fields_from_excel()
@@ -9962,11 +10212,18 @@ elif selected_mode == "AI Assessment from Existing Indices":
         key="ai_input_mode",
         on_change=_on_ai_input_mode_change,
     )
+    if st.session_state["ai_input_mode"] == "From uploaded Excel" and not _upload_ai_ready(_excel_assessment):
+        st.warning(
+            "The current workbook is Pending or needs to be reloaded under the current B01 rules. "
+            "It cannot populate AI inputs or produce an AI prediction. Complete its required indices, "
+            "or explicitly select Manual entry for a separate scenario."
+        )
+        st.stop()
     if st.session_state["ai_input_mode"] == "Manual entry":
         st.info("Manual mode: enter building information and available indices yourself. No Excel upload is required.")
     else:
-        st.success("Excel mode: fields were loaded from the last validated complete building assessment.")
-        if st.button("Reload all fields from validated Excel", key="ai_reload_from_excel"):
+        st.info("Excel mode: numeric inputs are from the current recalculated workbook. Source-review qualifications still apply.")
+        if st.button("Reload fields from current Excel", key="ai_reload_from_excel"):
             _set_ai_fields_from_excel()
             st.rerun()
         if st.session_state.get("ai_excel_function_unmapped"):
@@ -10222,8 +10479,8 @@ elif selected_mode == "AI Assessment from Existing Indices":
 
 
     uploaded_reference = st.session_state.get("uploaded_complete_assessment")
-    if uploaded_reference is not None and st.session_state.get("ai_input_mode") == "From uploaded Excel":
-        st.caption("AI inputs were prefilled from the last validated complete Excel assessment. "
+    if _upload_ai_ready(uploaded_reference) and st.session_state.get("ai_input_mode") == "From uploaded Excel":
+        st.caption("AI inputs were prefilled from the current recalculated Excel assessment. "
                    "Changes to these fields create a separate assessment scenario.")
         loaded_info = uploaded_reference["building_info"]
         same_inputs = (
@@ -10388,6 +10645,9 @@ elif selected_mode == "AI Assessment from Existing Indices":
         type="primary",
         use_container_width=True,
     ):
+        if st.session_state.get("ai_input_mode") == "From uploaded Excel" and not _upload_ai_ready(uploaded_reference):
+            st.error("Pending or stale Excel results cannot be used for AI prediction.")
+            st.stop()
         if (st.session_state.get("ai_input_mode") == "From uploaded Excel"
                 and st.session_state.get("ai_excel_function_unmapped")
                 and building_function == st.session_state.get("ai_excel_function_unmapped")):
@@ -10407,6 +10667,9 @@ elif selected_mode == "AI Assessment from Existing Indices":
                     si,
                 )
             )
+
+            if calculated_fai is None:
+                raise ValueError("AI prediction requires complete finite indices within 0–100; a Pending result is not an input.")
 
             input_data = pd.DataFrame(
                 {
